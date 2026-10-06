@@ -224,6 +224,22 @@ is_port(){ [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 is_num(){ [[ $1 =~ ^[0-9]+$ ]] && (( $1 > 0 )); }
 is_vlan(){ [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 4094 )); }
 is_any(){ [[ -n $1 ]]; }
+is_range(){ [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}-([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+ip2int(){ local IFS=. a b c d; read -r a b c d <<< "$1"; echo $(( (a<<24) + (b<<16) + (c<<8) + d )); }
+int2ip(){ echo "$(( ($1>>24)&255 )).$(( ($1>>16)&255 )).$(( ($1>>8)&255 )).$(( $1&255 ))"; }
+cidr_net(){ # 192.168.88.1/24 -> 192.168.88.0/24
+  local ip=${1%%/*} len=${1##*/}; [[ $1 == */* ]] || len=32
+  local m=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+  echo "$(int2ip $(( $(ip2int "$ip") & m )))/$len"
+}
+cidr_pool(){ # rango DHCP por defecto: de .10 (o .2 en redes chicas) al penultimo, sin el gateway
+  local ip=${1%%/*} len=${1##*/} n b gw first last
+  n=$(ip2int "$(cidr_net "$1" | cut -d/ -f1)"); b=$(( n + (1 << (32 - len)) - 1 )); gw=$(ip2int "$ip")
+  if (( (1 << (32 - len)) > 32 )); then first=$(( n + 10 )); else first=$(( n + 2 )); fi
+  last=$(( b - 1 ))
+  (( gw >= first && gw <= last )) && { (( gw - first > last - gw )) && last=$(( gw - 1 )) || first=$(( gw + 1 )); }
+  echo "$(int2ip $first)-$(int2ip $last)"
+}
 
 input(){ # var "pregunta" default validador "error" ["pista"]
   local __v=$1 q=$2 def=$3 val=${4:-is_any} emsg=${5:-"Valor no válido."} tip=${6:-}
@@ -308,10 +324,10 @@ rget(){ # baja archivos del router a esta carpeta
   done
 }
 
-BOARD=""; IDENT=""; ROS_VER=""; FWCOUNT=0; IFLIST=(); IFTYPE=(); IFRUN=(); IFADDR=()
+BOARD=""; IDENT=""; ROS_VER=""; FWCOUNT=0; ARCH=""; CPUN=0; LICLEVEL=""; IS_CHR=0; IFLIST=(); IFTYPE=(); IFRUN=(); IFADDR=()
 detect_router(){
   local raw
-  raw=$(rssh ':put ("BOARD|" . [/system resource get board-name]); :put ("IDENT|" . [/system identity get name]); :put ("VER|" . [/system resource get version]); :put ("FW|" . [:len [/ip firewall filter find]]); :foreach i in=[/interface find where !disabled] do={ :local n [/interface get $i name]; :local a ""; :foreach x in=[/ip address find where interface=$n] do={ :set a ([/ip address get $x address]) }; :put ("IF|" . $n . "|" . [/interface get $i type] . "|" . [/interface get $i running] . "|" . $a) }' 2>/dev/null | tr -d '\r')
+  raw=$(rssh ':put ("BOARD|" . [/system resource get board-name]); :put ("IDENT|" . [/system identity get name]); :put ("VER|" . [/system resource get version]); :put ("FW|" . [:len [/ip firewall filter find]]); :put ("ARCH|" . [/system resource get architecture-name]); :put ("CPUN|" . [/system resource get cpu-count]); :do { :put ("LIC|" . [/system license get level]) } on-error={}; :foreach i in=[/interface find where !disabled] do={ :local n [/interface get $i name]; :local a ""; :foreach x in=[/ip address find where interface=$n] do={ :set a ([/ip address get $x address]) }; :put ("IF|" . $n . "|" . [/interface get $i type] . "|" . [/interface get $i running] . "|" . $a) }' 2>/dev/null | tr -d '\r')
   [[ -z $raw ]] && return 1
   IFLIST=(); IFTYPE=(); IFRUN=(); IFADDR=()
   local l f1 f2 f3 f4 f5
@@ -319,12 +335,18 @@ detect_router(){
     IFS='|' read -r f1 f2 f3 f4 f5 <<< "$l"
     case $f1 in
       BOARD) BOARD=$f2;; IDENT) IDENT=$f2;; VER) ROS_VER=$f2;; FW) FWCOUNT=$f2;;
+      ARCH) ARCH=$f2;; CPUN) CPUN=$f2;; LIC) LICLEVEL=$f2;;
       IF) IFLIST+=("$f2"); IFTYPE+=("$f3"); IFRUN+=("$f4"); IFADDR+=("$f5");;
     esac
   done <<< "$raw"
   [[ -n $BOARD ]] || return 1
+  # CHR = RouterOS virtual (Proxmox, VMware, nube). No trae config de fabrica.
+  IS_CHR=0; [[ $BOARD == CHR* || $BOARD == *"CHR"* ]] && IS_CHR=1
   return 0
 }
+
+# Interfaz por la que entra la sesion SSH actual (la que tiene la IP de RHOST)
+mgmt_if(){ local i; for i in "${!IFLIST[@]}"; do [[ ${IFADDR[i]%%/*} == "$RHOST" ]] && { echo "${IFLIST[i]}"; return; }; done; }
 
 ifidx(){ local i; for i in "${!IFLIST[@]}"; do [[ ${IFLIST[i]} == "$1" ]] && { echo "$i"; return; }; done; echo -1; }
 ifdesc(){
@@ -351,9 +373,10 @@ probe_link(){ # mira si el puerto del enlace ya tiene IP y servidor DHCP
 
 AUDIT_FT=0; AUDIT_DEFROUTE=0; AUDIT_MANGLE=0; AUDIT_TABLES=""; AUDIT_NAT=0
 AUDIT_HOTSPOT=0; AUDIT_PPPSRV=0; AUDIT_QUEUE=0; AUDIT_ROLLBACK=0; AUDIT_LBW=0
+AUDIT_DHCPSRV=0; AUDIT_FWIN=0; AUDIT_FWFWD=0; AUDIT_DHCPDR=0
 audit_router(){
   local raw
-  raw=$(rssh ':put ("FT|" . [:len [/ip firewall filter find where action=fasttrack-connection && !disabled]]); :put ("DR|" . [:len [/ip route find where dst-address="0.0.0.0/0" && static]]); :put ("MR|" . [:len [/ip firewall mangle find where action=mark-routing && !(comment~"^LBW")]]); :put ("TB|" . [:len [/routing table find where !(name="main")]]); :put ("NT|" . [:len [/ip firewall nat find where action=masquerade && out-interface-list=""]]); :put ("HS|" . [:len [/ip hotspot find]]); :put ("PS|" . [:len [/interface pppoe-server server find]]); :put ("QS|" . [:len [/queue simple find]]); :put ("RB|" . [:len [/system scheduler find where comment~"ROLLBACK-LBW"]]); :put ("LB|" . [:len [/ip firewall mangle find where comment~"^LBW"]])' 2>/dev/null | tr -d '\r')
+  raw=$(rssh ':put ("FT|" . [:len [/ip firewall filter find where action=fasttrack-connection && !disabled]]); :put ("DR|" . [:len [/ip route find where dst-address="0.0.0.0/0" && static]]); :put ("MR|" . [:len [/ip firewall mangle find where action=mark-routing && !(comment~"^LBW")]]); :put ("TB|" . [:len [/routing table find where !(name="main")]]); :put ("NT|" . [:len [/ip firewall nat find where action=masquerade && out-interface-list=""]]); :put ("HS|" . [:len [/ip hotspot find]]); :put ("PS|" . [:len [/interface pppoe-server server find]]); :put ("QS|" . [:len [/queue simple find]]); :put ("RB|" . [:len [/system scheduler find where comment~"ROLLBACK-LBW"]]); :put ("LB|" . [:len [/ip firewall mangle find where comment~"^LBW"]]); :put ("DS|" . [:len [/ip dhcp-server find where !disabled]]); :put ("FI|" . [:len [/ip firewall filter find where chain=input && !dynamic && !disabled]]); :put ("FF|" . [:len [/ip firewall filter find where chain=forward && !dynamic && !disabled]]); :do { :local dd 0; :foreach c in=[/ip dhcp-client find where !disabled] do={ :local v [:tostr [/ip dhcp-client get $c add-default-route]]; :if ($v != "no" && $v != "false") do={ :set dd ($dd + 1) } }; :put ("DD|" . $dd) } on-error={}' 2>/dev/null | tr -d '\r')
   [[ -z $raw ]] && return 1
   local l a b
   while IFS= read -r l; do
@@ -362,6 +385,7 @@ audit_router(){
       FT) AUDIT_FT=${b:-0};; DR) AUDIT_DEFROUTE=${b:-0};; MR) AUDIT_MANGLE=${b:-0};;
       TB) AUDIT_TABLES=${b:-0};; NT) AUDIT_NAT=${b:-0};; HS) AUDIT_HOTSPOT=${b:-0};;
       PS) AUDIT_PPPSRV=${b:-0};; QS) AUDIT_QUEUE=${b:-0};; RB) AUDIT_ROLLBACK=${b:-0};; LB) AUDIT_LBW=${b:-0};;
+      DS) AUDIT_DHCPSRV=${b:-0};; FI) AUDIT_FWIN=${b:-0};; FF) AUDIT_FWFWD=${b:-0};; DD) AUDIT_DHCPDR=${b:-0};;
     esac
   done <<< "$raw"
   return 0
@@ -381,6 +405,7 @@ MODE="lb"; NWAN=2; CLASSIFIER="both-addresses"; LANIFS=""; LANNETS=""
 DNS="1.1.1.1,8.8.8.8"; DNSREMOTE="s"; MSSCLAMP="s"; PROTECTWAN="s"
 ROLE="router"; DOWNGW=""; BALIP=""; CLIENTNETS=""; LINKMODE="auto"; LINKNET=""; UPIF="ether1"; LINKDHCP="si"
 TGENABLE="n"; TGTOKEN=""; TGCHAT=""; ROLLBACK_MIN=10; STARTMODE="keep"
+LANMODE="existing"; LANCREATE="n"; LANPORTS=""; LANGW=""; LANPOOL=""
 OUTNAME="lbw-config.rsc"
 
 gcd(){ local a=$1 b=$2 t; while (( b )); do t=$b; b=$(( a % b )); a=$t; done; echo "$a"; }
@@ -458,7 +483,7 @@ do_reset(){ # resetea y vuelve a conectar, para que el asistente vea el router l
   box "$CW" "Esto va a resetear el router" \
     "Se borra TODA la configuración: IPs, firewall, DHCP, usuarios y archivos." \
     "El router se reinicia y pierdes la conexión actual." \
-    "$([[ $kind == bare ]] && echo "Quedará SIN IP y SIN DHCP: solo lo recuperas por cable con MAC-Winbox." || echo "Volverá con la configuración de fábrica en 192.168.88.1, usuario admin sin contraseña.")" \
+    "$([[ $kind == bare ]] && echo "Quedará SIN IP y SIN DHCP: solo lo recuperas por cable con MAC-Winbox." || echo "Volverá con la configuración de fábrica en 192.168.88.1, usuario admin y la contraseña de la etiqueta (vacía en equipos antiguos).")" \
     "Tu PC tendrá que renovar la IP para volver a entrar."
   local c
   q confirm c "¿Seguro que quieres resetear?" n || return 10
@@ -481,12 +506,17 @@ do_reset(){ # resetea y vuelve a conectar, para que el asistente vea el router l
   echo
   box "$CA" "El router se está reiniciando" \
     "Renueva la IP en tu PC (desconecta y conecta el cable, o pide IP otra vez)." \
-    "$([[ $kind == bare ]] && echo "Sin configuración no hay DHCP ni IP: entra por MAC-Winbox, ponle una IP y vuelve aquí." || echo "Cuando vuelva: 192.168.88.1, usuario admin, contraseña vacía.")"
+    "$([[ $kind == bare ]] && echo "Sin configuración no hay DHCP ni IP: entra por MAC-Winbox, ponle una IP y vuelve aquí." || echo "Cuando vuelva: 192.168.88.1, usuario admin, contraseña de la etiqueta (o vacía en equipos antiguos).")" \
+    "Si al entrar te obliga a cambiar la contraseña, hazlo una vez por Winbox y vuelve aquí."
   echo
   if [[ $kind == bare ]]; then
     RHOST=""; RUSER="admin"; RPORT="22"; SSHPASS=""
   else
-    RHOST="192.168.88.1"; RUSER="admin"; RPORT="22"; SSHPASS=""; export SSHPASS
+    RHOST="192.168.88.1"; RUSER="admin"; RPORT="22"; SSHPASS=""
+    if command -v sshpass >/dev/null 2>&1; then
+      secret SSHPASS "Contraseña tras el reset (la de la etiqueta; Enter si no trae)"
+    fi
+    export SSHPASS
     info "Esperando a que el router vuelva (hasta 2 minutos)…"
     local s2
     for s2 in $(seq 1 60); do
@@ -527,6 +557,7 @@ step_router(){
     "Modelo:     $BOARD" \
     "Nombre:     $IDENT" \
     "RouterOS:   $ROS_VER" \
+    "Plataforma: $( ((IS_CHR)) && echo "CHR (virtual) · licencia ${LICLEVEL:-?}" || echo "RouterBOARD físico · ${ARCH:-?} · ${CPUN:-?} núcleo(s)")" \
     "Interfaces: $nif utilizables como WAN" \
     "Firewall:   $FWCOUNT reglas"
   echo
@@ -534,7 +565,15 @@ step_router(){
     local alerts=()
     (( AUDIT_ROLLBACK > 0 )) && alerts+=("⚠ Hay una red de seguridad (ROLLBACK-LBW) armada de un intento anterior: te borrará esta configuración si no la desarmas.")
     (( AUDIT_LBW > 0 )) && alerts+=("⚠ Ya hay reglas LBW en el router. Se reemplazan al aplicar.")
-    (( AUDIT_FT > 0 )) && alerts+=("• FastTrack activo ($AUDIT_FT reglas): se desactiva, es incompatible con el balanceo. Sube el uso de CPU.")
+    if (( AUDIT_FT > 0 )); then
+      if (( IS_CHR )); then alerts+=("• FastTrack activo ($AUDIT_FT reglas): se desactiva, es incompatible con el balanceo. En CHR el costo de CPU es bajo.")
+      else alerts+=("• FastTrack activo ($AUDIT_FT reglas): se desactiva, es incompatible con el balanceo. En equipos ${ARCH:-ARM/MIPS} de pocos núcleos baja el máximo de Mbps: revisa la tabla 'Test results' de tu modelo en mikrotik.com."); fi
+    fi
+    (( IS_CHR )) && [[ ${LICLEVEL,,} == free ]] && alerts+=("• CHR con licencia free: cada interfaz queda limitada a 1 Mbps de subida. Sirve para probar el failover y el reparto, NO para medir velocidad (usa la prueba p1 de 60 días).")
+    (( AUDIT_DHCPDR > 0 )) && alerts+=("• $AUDIT_DHCPDR DHCP client(s) instalan su propia ruta por defecto. Los que no sean WAN de LBW pasan a distancia 200 (quedan de último recurso); el desinstalador les devuelve su valor.")
+    if (( AUDIT_FWIN == 0 || AUDIT_FWFWD == 0 )); then alerts+=("• Firewall incompleto (input: $AUDIT_FWIN reglas, forward: $AUDIT_FWFWD). Contesta Sí a 'Bloquear el acceso desde Internet' en Extras: pone las reglas básicas del defconf.")
+    fi
+    (( AUDIT_DHCPSRV == 0 )) && alerts+=("• No hay servidor DHCP activo: en modo todo en uno el asistente te ofrecerá crear la LAN (bridge, IP y DHCP).")
     (( AUDIT_DEFROUTE > 0 )) && alerts+=("• $AUDIT_DEFROUTE ruta(s) por defecto estáticas: se apartan y el desinstalador las devuelve.")
     (( AUDIT_MANGLE > 0 )) && alerts+=("• $AUDIT_MANGLE regla(s) mangle con mark-routing ajenas: pueden pelear con el balanceo. Revísalas a mano.")
     (( AUDIT_TABLES > 0 )) && alerts+=("• $AUDIT_TABLES tabla(s) de ruteo ya creadas: si se llaman to_WANx habrá conflicto.")
@@ -546,10 +585,18 @@ step_router(){
     else box "$CO" "Qué encontré en este router" "Nada que choque con el balanceo. Router limpio."; fi
     echo
   fi
-  q menu STARTMODE "¿Cómo quieres partir?" 1 \
-    "keep|Trabajar sobre la configuración actual  ★ recomendado|Aparta solo lo que choca y lo marca como PRE-LBW para que el desinstalador lo devuelva. No pierdes port forwards, VPN ni DHCP estáticos." \
-    "reset|Resetear a configuración de fábrica primero|Router nuevo o de caja. Se hace AHORA, antes de seguir, para que el asistente vea los nombres reales de después." \
-    "bare|Reset total sin configuración (avanzado)|El router queda sin IP y sin DHCP: solo recuperable por cable con MAC-Winbox." || return 10
+  if (( IS_CHR )); then
+    # El CHR no tiene configuracion de fabrica (sin 192.168.88.1, sin bridge,
+    # sin firewall): "resetear a fabrica" no aporta nada y deja la VM a ciegas.
+    q menu STARTMODE "¿Cómo quieres partir?" 1 \
+      "keep|Trabajar sobre la configuración actual  ★ recomendado|Aparta solo lo que choca y lo marca como PRE-LBW para que el desinstalador lo devuelva." \
+      "bare|Reset total sin configuración (avanzado)|El CHR queda sin IP: solo lo recuperas por la consola de la VM (Proxmox, VMware…)." || return 10
+  else
+    q menu STARTMODE "¿Cómo quieres partir?" 1 \
+      "keep|Trabajar sobre la configuración actual  ★ recomendado|Aparta solo lo que choca y lo marca como PRE-LBW para que el desinstalador lo devuelva. No pierdes port forwards, VPN ni DHCP estáticos." \
+      "reset|Resetear a configuración de fábrica primero|Router nuevo o de caja. Se hace AHORA, antes de seguir, para que el asistente vea los nombres reales de después." \
+      "bare|Reset total sin configuración (avanzado)|El router queda sin IP y sin DHCP: solo recuperable por cable con MAC-Winbox." || return 10
+  fi
   if [[ $STARTMODE != keep ]]; then
     do_reset "$STARTMODE"; rc=$?
     (( rc == 10 )) && return 10
@@ -562,7 +609,7 @@ step_router(){
         if (( resto == 0 )); then
           box "$CO" "Router de fábrica, sin residuos" \
             "Sin reglas LBW, sin tablas de ruteo propias, sin mangle ajeno y sin rollback pendiente." \
-            "Firewall de fábrica: $FWCOUNT reglas (se conservan; son buenas)." \
+            "Firewall de fábrica: $FWCOUNT reglas (se conservan; LBW suma las suyas sin duplicar el orden)." \
             "FastTrack activo: $AUDIT_FT regla(s), se desactiva al aplicar."
         else
           box "$CW" "Quedó algo del estado anterior" \
@@ -770,18 +817,76 @@ step_lan(){
     DNSREMOTE="n"
     warn "El router de abajo NO debe hacer NAT: si enmascara, el balanceo por equipo deja de funcionar. Su archivo ya se lo quita."
   else
-    if (( DETECTED )); then
-      q menu lpick "¿Cuál es tu red local (LAN)?" 1 "${lopts[@]}" || return 10
-      if [[ $lpick == __other ]]; then
-        q input LANIFS "Interfaz o interfaces de la LAN (separadas por coma)" "${LANIFS:-bridge}" is_any || return 10
-      else LANIFS=$lpick; fi
-      k=$(ifidx "$LANIFS"); defnet=${IFADDR[k]:-192.168.88.1/24}
-      defnet=$(awk -F'[./]' '{printf "%s.%s.%s.0/%s", $1,$2,$3,$5}' <<< "$defnet")
+    # --- Modo todo en uno: la LAN la arma LBW o se usa una que ya existe ---
+    local nexist=0 defm=1
+    (( DETECTED )) && nexist=$(( ${#lopts[@]} - 1 ))
+    # Sin LAN con IP o sin servidor DHCP (CHR, reset sin config): crear es lo normal
+    if (( DETECTED )) && (( nexist == 0 || AUDIT_DHCPSRV == 0 )); then defm=1
+    elif (( DETECTED )); then defm=2
+    else defm=2; fi
+    q menu LANMODE "¿Cómo queda la red local (LAN)?" "$defm" \
+      "create|Crear la LAN: bridge, IP y servidor DHCP|Para CHR, routers sin configuración o si quieres una LAN nueva. Todo lo creado lleva la marca LBW:lan y el desinstalador lo quita." \
+      "existing|Usar una LAN que ya existe|Router de fábrica (bridge 192.168.88.1 con su DHCP) o una LAN que ya armaste tú." || return 10
+
+    if [[ $LANMODE == create ]]; then
+      LANCREATE="s"
+      local mg free=""
+      mg=$(mgmt_if)
+      if (( DETECTED )); then
+        for x in "${IFLIST[@]}"; do
+          k=$(ifidx "$x")
+          [[ ${IFTYPE[k]} == ether ]] || continue
+          [[ $USED_IFS == *" $x "* || $USED_IFS == *" ${x%_ISP[0-9]} "* ]] && continue
+          [[ -n ${IFADDR[k]} || $x == "$mg" ]] && continue
+          free+="${free:+,}$x"
+        done
+      fi
+      [[ -z $free ]] && free="ether3"
+      while true; do
+        q input LANPORTS "Puertos que forman la LAN (separados por coma)" "${LANPORTS:-$free}" is_any "Escribe al menos un puerto." "Se meten en un bridge nuevo llamado bridge-lan. Si alguno estaba en otro bridge, se mueve y el desinstalador lo devuelve." || return 10
+        LANPORTS=$(tr -d ' ' <<< "$LANPORTS")
+        if [[ -n $mg && ",$LANPORTS," == *",$mg,"* ]]; then
+          box "$CE" "Ojo: por $mg entras tú ahora mismo" \
+            "Ese puerto tiene la IP $RHOST. Al meterlo en bridge-lan esa IP deja de funcionar" \
+            "y perderás esta conexión a mitad del import (la red de seguridad revertirá todo)." \
+            "Lo normal es dejar fuera el puerto de gestión."
+          local gok; q confirm gok "¿Lo meto de todos modos?" n || return 10
+          [[ $gok != s ]] && { LANPORTS=$free; continue; }
+        fi
+        break
+      done
+      local defgw="192.168.88.1/24" used_nets=" " cand
+      for k in "${!IFADDR[@]}"; do [[ -n ${IFADDR[k]} ]] && used_nets+="$(cidr_net "${IFADDR[k]}") "; done
+      for cand in 192.168.88.1/24 192.168.50.1/24 10.10.10.1/24 172.20.0.1/24; do
+        [[ $used_nets != *" $(cidr_net "$cand") "* ]] && { defgw=$cand; break; }
+      done
+      while true; do
+        q input LANGW "IP del router en la LAN (con máscara)" "${LANGW:-$defgw}" is_cidr "Formato: 192.168.88.1/24" "Será el gateway y el DNS de los equipos de la LAN" || return 10
+        if [[ $used_nets == *" $(cidr_net "$LANGW") "* ]]; then
+          err "La red $(cidr_net "$LANGW") ya está en uso en otra interfaz del router. Elige otra."
+          continue
+        fi
+        (( ${LANGW##*/} < 16 || ${LANGW##*/} > 29 )) && { err "Usa una máscara entre /16 y /29."; continue; }
+        break
+      done
+      LANNETS=$(cidr_net "$LANGW")
+      q input LANPOOL "Rango que reparte el DHCP" "${LANPOOL:-$(cidr_pool "$LANGW")}" is_range "Formato: 192.168.88.10-192.168.88.254" || return 10
+      LANIFS="bridge-lan"
     else
-      q input LANIFS "Interfaz o interfaces de la LAN (separadas por coma)" "${LANIFS:-bridge}" is_any || return 10
-      defnet="192.168.88.0/24"
+      LANCREATE="n"
+      if (( DETECTED )); then
+        q menu lpick "¿Cuál es tu red local (LAN)?" 1 "${lopts[@]}" || return 10
+        if [[ $lpick == __other ]]; then
+          q input LANIFS "Interfaz o interfaces de la LAN (separadas por coma)" "${LANIFS:-bridge}" is_any || return 10
+        else LANIFS=$lpick; fi
+        k=$(ifidx "$LANIFS"); defnet=${IFADDR[k]:-192.168.88.1/24}
+        defnet=$(cidr_net "$defnet")
+      else
+        q input LANIFS "Interfaz o interfaces de la LAN (separadas por coma)" "${LANIFS:-bridge}" is_any || return 10
+        defnet="192.168.88.0/24"
+      fi
+      q input LANNETS "Subred o subredes de la LAN (separadas por coma)" "${LANNETS:-$defnet}" is_any "Formato: 192.168.88.0/24" "Si tienes VLANs internas, ponlas todas: 192.168.10.0/24,192.168.20.0/24" || return 10
     fi
-    q input LANNETS "Subred o subredes de la LAN (separadas por coma)" "${LANNETS:-$defnet}" is_any "Formato: 192.168.88.0/24" "Si tienes VLANs internas, ponlas todas: 192.168.10.0/24,192.168.20.0/24" || return 10
   fi
 
   while true; do
@@ -834,10 +939,11 @@ step_summary(){
     modetxt=$([[ $MODE == lb ]] && echo "Balanceo + respaldo · reparto por $CLASSIFIER" || echo "Solo respaldo, por orden de prioridad")
     box "$CA" "Tu configuración" "Modo: $modetxt" \
       "Papel: $([[ $ROLE == router ]] && echo "balanceador y router de la LAN" || echo "solo balanceador, delante de otro router")" "" "${tl[@]}" "" \
-      "$([[ $ROLE == router ]] && echo "LAN: $LANIFS → $LANNETS" || echo "Enlace: $LANIFS · este $BALIP · abajo $DOWNGW · clientes $CLIENTNETS")" \
+      "$([[ $ROLE == router ]] && { [[ $LANCREATE == s ]] && echo "LAN nueva: bridge-lan ($LANPORTS) · $LANGW · DHCP $LANPOOL" || echo "LAN: $LANIFS → $LANNETS"; } || echo "Enlace: $LANIFS · este $BALIP · abajo $DOWNGW · clientes $CLIENTNETS")" \
       "DNS: $DNS" \
       "Red de seguridad: $ROLLBACK_MIN minutos"
     [[ $MODE == lb ]] && warn "Se desactiva FastTrack (incompatible con el balanceo): sube el uso de CPU."
+    [[ $PROTECTWAN == s ]] && hint "Firewall: arriba se ponen las reglas que aceptan (established, LAN) y abajo las que descartan desde la WAN, para no tapar tus reglas de VPN o port forwards."
     if [[ $ROLE == balancer ]]; then
       warn "El router de abajo debe quedar en ruteo puro: sin NAT y sin FastTrack. Te genero su archivo aparte."
       hint "Las colas simples de ese router no se tocan: clasifican por IP de cliente, no por marcas de ruteo. Sí revisa los queue tree con packet-marks en prerouting."
@@ -870,22 +976,89 @@ while (( STEP <= 7 )); do
 done
 
 # ======================= Generador del .rsc ==========================
-MONITOR_SRC=""
+urlenc(){ local s=$1; s=${s//%/%25}; s=${s// /%20}; s=${s//:/%3A}; s=${s//&/%26}; printf '%s' "$s"; }
+
+# El monitor se escribe como bloque {...} (igual que el ejemplo oficial de
+# /system script add source={...}), sin escapar comillas a mano.
+# - 60 s de gracia tras el arranque: las rutas aun no estan activas y daria
+#   falsas CAIDAS (y alertas por Telegram) en cada reinicio.
+# - Primera pasada: solo registra el estado, no borra conexiones ni avisa.
+# - Mantiene en LBW-local las redes conectadas de cada WAN (DHCP, PPPoE o
+#   fija), para que el PCC no mande por otra linea el trafico al modem del ISP.
 build_monitor(){
-  local i s=""
+  local i tgu tgd
+  echo ':if ([/system resource get uptime] >= 60s) do={'
   for ((i=1; i<=NWAN; i++)); do
-    local mark="LBW:WAN$i:OWN"
-    s+=":global LBWs$i;"
-    s+=":local u$i ([:len [/ip route find where comment=\\\"$mark\\\" && active]] > 0);"
-    s+=":if (\\\$u$i != \\\$LBWs$i) do={:set LBWs$i \\\$u$i;"
-    s+=":if (\\\$u$i) do={:log warning \\\"LBW: ${WNAME[$i]} (WAN$i) EN LINEA\\\";"
-    [[ $TGENABLE == s ]] && s+="/tool fetch keep-result=no mode=https url=(\\\"https://api.telegram.org/bot$TGTOKEN/sendMessage\\\\?chat_id=$TGCHAT&text=LBW: ${WNAME[$i]} EN LINEA\\\");"
-    s+="} else={:log error \\\"LBW: ${WNAME[$i]} (WAN$i) CAIDA\\\";"
-    s+="/ip firewall connection remove [find where connection-mark=\\\"ISP${i}_conn\\\"];"
-    [[ $TGENABLE == s ]] && s+="/tool fetch keep-result=no mode=https url=(\\\"https://api.telegram.org/bot$TGTOKEN/sendMessage\\\\?chat_id=$TGCHAT&text=LBW: ${WNAME[$i]} CAIDA\\\");"
-    s+="};};"
+    cat << MON
+  :foreach a in=[/ip address find where interface="${WFINAL[$i]}" && !disabled] do={
+    :local ad [/ip address get \$a address]
+    :local pf [:pick \$ad ([:find \$ad "/"] + 1) [:len \$ad]]
+    :local nw [:tostr [/ip address get \$a network]]
+    :if (\$pf != "32") do={ :set nw (\$nw . "/" . \$pf) }
+    :if ([:len [/ip firewall address-list find where list="LBW-local" && address=\$nw]] = 0) do={
+      :do { /ip firewall address-list add list=LBW-local address=\$nw comment="LBW:local:wan$i" } on-error={}
+    }
+  }
+MON
   done
-  MONITOR_SRC=$s
+  for ((i=1; i<=NWAN; i++)); do
+    tgu=""; tgd=""
+    if [[ $TGENABLE == s ]]; then
+      tgu=":do { /tool fetch keep-result=no url=\"https://api.telegram.org/bot$TGTOKEN/sendMessage\\?chat_id=$TGCHAT&text=$(urlenc "LBW: ${WNAME[$i]} EN LINEA")\" } on-error={}"
+      tgd=":do { /tool fetch keep-result=no url=\"https://api.telegram.org/bot$TGTOKEN/sendMessage\\?chat_id=$TGCHAT&text=$(urlenc "LBW: ${WNAME[$i]} CAIDA")\" } on-error={}"
+    fi
+    cat << MON
+  :global LBWs$i
+  :local u$i ([:len [/ip route find where comment="LBW:WAN$i:OWN" && active]] > 0)
+  :if ([:typeof \$LBWs$i] = "nothing") do={
+    :set LBWs$i \$u$i
+    :if (\$u$i) do={ :log info "LBW: ${WNAME[$i]} (WAN$i) en linea al iniciar el monitor" } else={ :log warning "LBW: ${WNAME[$i]} (WAN$i) sin salida al iniciar el monitor" }
+  } else={
+    :if (\$u$i != \$LBWs$i) do={
+      :set LBWs$i \$u$i
+      :if (\$u$i) do={
+        :log warning "LBW: ${WNAME[$i]} (WAN$i) EN LINEA"
+        $tgu
+      } else={
+        :log error "LBW: ${WNAME[$i]} (WAN$i) CAIDA"
+        /ip firewall connection remove [find where connection-mark="ISP${i}_conn"]
+        $tgd
+      }
+    }
+  }
+MON
+  done
+  echo '}'
+}
+
+# Reglas del firewall: las que ACEPTAN y descartan invalidos van ARRIBA de
+# todo (antes de un "drop all" que ya hubiera); los DROP desde la WAN van al
+# FINAL, para no tapar reglas que el usuario ya tenga (VPN, port forwards).
+fw_top(){ echo "  :if (\$hasA) do={ /ip firewall filter add $1 place-before=\$anchor } else={ /ip firewall filter add $1 }"; }
+gen_firewall(){
+  [[ $PROTECTWAN != s && $DNSREMOTE != s ]] && return 0
+  echo
+  echo "# --- 8. Firewall basico (equivalente al defconf de MikroTik) ---------"
+  if [[ $PROTECTWAN == s ]]; then
+    echo ':do {'
+    echo '  :local hasA false'
+    echo '  :local anchor'
+    echo '  :local cand [/ip firewall filter find where !dynamic && !(comment~"^LBW")]'
+    echo '  :if ([:len $cand] > 0) do={ :set anchor [:pick $cand 0]; :set hasA true }'
+    fw_top 'chain=input action=accept connection-state=established,related,untracked comment="LBW:FW:in-est"'
+    fw_top 'chain=input action=drop connection-state=invalid comment="LBW:FW:in-invalid"'
+    fw_top 'chain=input action=accept protocol=icmp limit=10,20:packet comment="LBW:FW:icmp"'
+    fw_top 'chain=input action=accept in-interface-list=LBW-LAN comment="LBW:FW:lan"'
+    fw_top 'chain=forward action=accept connection-state=established,related,untracked comment="LBW:FW:fwd-est"'
+    fw_top 'chain=forward action=drop connection-state=invalid comment="LBW:FW:fwd-invalid"'
+    echo '} on-error={ :log error "LBW fallo: firewall (reglas de arriba)" }'
+    W '/ip firewall filter add chain=input action=drop in-interface-list=LBW-WAN comment="LBW:FW:drop-wan"' "fw drop wan"
+    W '/ip firewall filter add chain=forward action=drop connection-state=new connection-nat-state=!dstnat in-interface-list=LBW-WAN comment="LBW:FW:fwd-wan"' "fw forward wan"
+  else
+    echo "# Sin proteccion general, pero el DNS del router no se deja abierto a Internet"
+    W '/ip firewall filter add chain=input action=drop protocol=udp dst-port=53 in-interface-list=LBW-WAN comment="LBW:FW:dns-wan-udp"' "fw dns udp"
+    W '/ip firewall filter add chain=input action=drop protocol=tcp dst-port=53 in-interface-list=LBW-WAN comment="LBW:FW:dns-wan-tcp"' "fw dns tcp"
+  fi
 }
 
 # W: envuelve un comando para que un fallo NO aborte el import completo
@@ -906,7 +1079,7 @@ gen_rsc(){
 :log warning "LBW: aplicando configuracion multi-WAN"
 
 # --- 0. Limpieza de una instalacion LBW previa -----------------------
-:do { /system scheduler remove [find where comment~"LBW"] } on-error={}
+:do { /system scheduler remove [find where comment~"^LBW"] } on-error={}
 :do { /system script remove [find where comment~"^LBW"] } on-error={}
 :do { /ip firewall mangle remove [find where comment~"^LBW"] } on-error={}
 :do { /ip firewall nat remove [find where comment~"^LBW"] } on-error={}
@@ -993,13 +1166,13 @@ RSC
       dhcp)
         cat << RSC
 :do {
-  /ip dhcp-client add interface="$fin" add-default-route=no use-peer-dns=no use-peer-ntp=no comment="LBW:NEW:WAN$i" script=":if ([:tobool \\\$bound]) do={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] gateway=\\\$\"gateway-address\" disabled=no} else={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] disabled=yes}; /ip/firewall/connection/remove [/ip/firewall/connection/find where connection-mark=\"ISP${i}_conn\"]"
+  /ip dhcp-client add interface="$fin" add-default-route=no use-peer-dns=no use-peer-ntp=no comment="LBW:NEW:WAN$i" script=":if (\\\$bound=1) do={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] gateway=\\\$\"gateway-address\" disabled=no} else={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] disabled=yes}; /ip/firewall/connection/remove [/ip/firewall/connection/find where connection-mark=\"ISP${i}_conn\"]"
 } on-error={
   :log warning "LBW: ya habia un DHCP client para WAN$i; lo reutilizo"
   :foreach c in=[/ip dhcp-client find where !disabled] do={
     :local ifn [/ip dhcp-client get \$c interface]
-    :if ([:tostr \$ifn] = "$fin") do={ /ip dhcp-client set \$c add-default-route=no use-peer-dns=no use-peer-ntp=no comment="LBW:WAN$i:adr=yes,dns=yes,ntp=yes" script=":if ([:tobool \\\$bound]) do={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] gateway=\\\$\"gateway-address\" disabled=no} else={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] disabled=yes}; /ip/firewall/connection/remove [/ip/firewall/connection/find where connection-mark=\"ISP${i}_conn\"]" }
-    :if ([:tostr \$ifn] = "$base") do={ /ip dhcp-client set \$c add-default-route=no use-peer-dns=no use-peer-ntp=no comment="LBW:WAN$i:adr=yes,dns=yes,ntp=yes" script=":if ([:tobool \\\$bound]) do={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] gateway=\\\$\"gateway-address\" disabled=no} else={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] disabled=yes}; /ip/firewall/connection/remove [/ip/firewall/connection/find where connection-mark=\"ISP${i}_conn\"]" }
+    :if ([:tostr \$ifn] = "$fin") do={ /ip dhcp-client set \$c add-default-route=no use-peer-dns=no use-peer-ntp=no comment="LBW:WAN$i:adr=yes,dns=yes,ntp=yes" script=":if (\\\$bound=1) do={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] gateway=\\\$\"gateway-address\" disabled=no} else={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] disabled=yes}; /ip/firewall/connection/remove [/ip/firewall/connection/find where connection-mark=\"ISP${i}_conn\"]" }
+    :if ([:tostr \$ifn] = "$base") do={ /ip dhcp-client set \$c add-default-route=no use-peer-dns=no use-peer-ntp=no comment="LBW:WAN$i:adr=yes,dns=yes,ntp=yes" script=":if (\\\$bound=1) do={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] gateway=\\\$\"gateway-address\" disabled=no} else={/ip/route/set [/ip/route/find where comment=\"LBW:WAN$i:PROBE\"] disabled=yes}; /ip/firewall/connection/remove [/ip/firewall/connection/find where connection-mark=\"ISP${i}_conn\"]" }
   }
 }
 RSC
@@ -1011,6 +1184,52 @@ RSC
 
 # --- 3. Red local ----------------------------------------------------
 RSC
+  if [[ $ROLE == router && $LANCREATE == s ]]; then
+    local lgw=${LANGW%%/*} ldns n=0 p
+    [[ $DNSREMOTE == s ]] && ldns=$lgw || ldns=$DNS
+    echo "# LAN nueva: bridge-lan con $LANPORTS · $LANGW · DHCP $LANPOOL"
+    echo ":if ([:len [/interface bridge find where name=\"bridge-lan\"]] = 0) do={"
+    W "  /interface bridge add name=bridge-lan comment=\"LBW:lan\"" "crear bridge-lan"
+    echo "}"
+    IFS=',' read -ra _lp <<< "$LANPORTS"
+    for p in "${_lp[@]}"; do
+      ((n++))
+      cat << RSC
+:do {
+  :foreach b in=[/interface bridge port find where interface="$p"] do={
+    :local br [:tostr [/interface bridge port get \$b bridge]]
+    :if (\$br != "bridge-lan") do={
+      :do { /ip firewall address-list add list=LBW-restore address=127.0.1.$n comment=("LBW:restore:br=" . \$br . ":if=$p") } on-error={}
+      /interface bridge port remove \$b
+      :log warning ("LBW: $p sacado del bridge " . \$br . " para la LAN nueva")
+    }
+  }
+  :if ([:len [/interface bridge port find where interface="$p"]] = 0) do={
+    /interface bridge port add bridge=bridge-lan interface="$p" comment="LBW:lan"
+  }
+} on-error={ :log error "LBW fallo: $p a bridge-lan" }
+RSC
+    done
+    echo ":if ([:len [/ip address find where address=\"$LANGW\"]] = 0) do={"
+    W "  /ip address add address=$LANGW interface=bridge-lan comment=\"LBW:lan\"" "IP de la LAN"
+    echo "}"
+    echo ":if ([:len [/ip pool find where name=\"LBW-lan\"]] = 0) do={"
+    W "  /ip pool add name=LBW-lan ranges=$LANPOOL comment=\"LBW:lan\"" "pool de la LAN"
+    echo "} else={ /ip pool set [find where name=\"LBW-lan\"] ranges=$LANPOOL }"
+    echo ":if ([:len [/ip dhcp-server network find where address=\"$LANNETS\"]] = 0) do={"
+    W "  /ip dhcp-server network add address=$LANNETS gateway=$lgw dns-server=$ldns comment=\"LBW:lan\"" "red DHCP de la LAN"
+    echo "}"
+    echo ":if ([:len [/ip dhcp-server find where name=\"LBW-lan\"]] = 0) do={"
+    W "  /ip dhcp-server add name=LBW-lan interface=bridge-lan address-pool=LBW-lan lease-time=1h disabled=no comment=\"LBW:lan\"" "servidor DHCP de la LAN"
+    echo "}"
+  fi
+  # Si existe la lista LAN del defconf, la LAN de LBW entra ahi tambien: si no,
+  # la regla de fabrica "drop all not coming from LAN" bloquearia a sus equipos.
+  IFS=',' read -ra _lifs <<< "$LANIFS"
+  for x in "${_lifs[@]}"; do
+    x=$(tr -d ' ' <<< "$x")
+    echo ":if ([:len [/interface list find where name=\"LAN\"]] > 0) do={ :do { /interface list member add list=LAN interface=\"$x\" comment=\"LBW:compat:LAN\" } on-error={} }"
+  done
   IFS=',' read -ra _lifs <<< "$LANIFS"
   for x in "${_lifs[@]}"; do
     x=$(tr -d ' ' <<< "$x")
@@ -1101,7 +1320,6 @@ RSC
 :do { /ip firewall mangle add chain=prerouting action=accept in-interface-list=LBW-LAN dst-address-list=LBW-local comment="LBW:local:skip" } on-error={ :log error "LBW fallo: skip local" }
 RSC
   for ((i=1; i<=NWAN; i++)); do
-    W "/ip firewall mangle add chain=input action=mark-connection in-interface-list=LBW-WAN$i connection-mark=no-mark new-connection-mark=ISP${i}_conn passthrough=yes comment=\"LBW:WAN$i:IN\"" "mangle input WAN$i"
     W "/ip firewall mangle add chain=prerouting action=mark-connection in-interface-list=LBW-WAN$i connection-mark=no-mark new-connection-mark=ISP${i}_conn passthrough=yes comment=\"LBW:WAN$i:FWD\"" "mangle fwd WAN$i"
   done
   if [[ $MODE == lb ]]; then
@@ -1110,7 +1328,7 @@ RSC
     echo "# PCC: $TOTBUCKETS partes repartidas segun la velocidad de cada linea"
     for ((i=1; i<=NWAN; i++)); do
       for ((k=0; k<${WEIGHT[$i]}; k++)); do
-        W "/ip firewall mangle add chain=prerouting action=mark-connection in-interface-list=LBW-LAN dst-address-list=!LBW-local connection-mark=no-mark new-connection-mark=ISP${i}_conn passthrough=yes per-connection-classifier=$CLASSIFIER:$TOTBUCKETS/$b comment=\"LBW:PCC:WAN$i:$b\"" "PCC $b"
+        W "/ip firewall mangle add chain=prerouting action=mark-connection in-interface-list=LBW-LAN dst-address-list=!LBW-local dst-address-type=!local connection-mark=no-mark new-connection-mark=ISP${i}_conn passthrough=yes per-connection-classifier=$CLASSIFIER:$TOTBUCKETS/$b comment=\"LBW:PCC:WAN$i:$b\"" "PCC $b"
         ((b++))
       done
     done
@@ -1128,20 +1346,8 @@ RSC
 # --- 7. NAT (se agrega ANTES de apartar el viejo) --------------------
 :do { /ip firewall nat add chain=srcnat action=masquerade out-interface-list=LBW-WAN ipsec-policy=out,none comment="LBW:NAT" } on-error={ :log error "LBW fallo: NAT" }
 RSC
-  if [[ $PROTECTWAN == s ]]; then
-    cat << RSC
+  gen_firewall
 
-# --- 8. Proteccion basica del router ---------------------------------
-
-:do { /ip firewall filter add chain=input action=accept connection-state=established,related comment="LBW:FW:established" } on-error={ :log error "LBW fallo: fw established" }
-:do { /ip firewall filter add chain=input action=accept protocol=icmp limit=10,20:packet comment="LBW:FW:icmp" } on-error={ :log error "LBW fallo: fw icmp" }
-:do { /ip firewall filter add chain=input action=drop connection-state=invalid comment="LBW:FW:invalid" } on-error={ :log error "LBW fallo: fw invalid" }
-:do { /ip firewall filter add chain=input action=accept in-interface-list=LBW-LAN comment="LBW:FW:lan" } on-error={ :log error "LBW fallo: fw lan" }
-:do { /ip firewall filter add chain=input action=drop in-interface-list=LBW-WAN comment="LBW:FW:drop-wan" } on-error={ :log error "LBW fallo: fw drop wan" }
-RSC
-  fi
-
-  build_monitor
   local hasdhcp=n
   for ((i=1; i<=NWAN; i++)); do [[ ${WTYPE[$i]} == dhcp ]] && hasdhcp=y; done
   if [[ $hasdhcp == y ]]; then
@@ -1170,7 +1376,11 @@ RSC
 
 # --- 9. Monitor de lineas --------------------------------------------
 
-:do { /system script add name=lbw-monitor comment="LBW: monitor de WANs - LBW Wizard por $AUTHOR_ASCII" source="$MONITOR_SRC" } on-error={ :log error "LBW fallo: script monitor" }
+:do {
+  /system script add name=lbw-monitor comment="LBW: monitor de WANs - LBW Wizard por $AUTHOR_ASCII" source={
+$(build_monitor)
+  }
+} on-error={ :log error "LBW fallo: script monitor" }
 :do { /system scheduler add name=lbw-monitor interval=10s comment="LBW: monitor" on-event="/system script run lbw-monitor" } on-error={ :log error "LBW fallo: scheduler monitor" }
 
 # --- 10. Ahora si: apartar lo viejo que estorba ----------------------
@@ -1186,6 +1396,23 @@ RSC
     /ip firewall nat set \$r disabled=yes comment=("PRE-LBW:" . \$c)
   }
 } on-error={ :log error "LBW fallo: apartar NAT viejo" }
+# DHCP clients que NO son WAN de LBW (p. ej. la gestion de un CHR) pero
+# instalan ruta por defecto: quedan de ultimo recurso con distancia 200.
+:do {
+  :foreach c in=[/ip dhcp-client find where !disabled] do={
+    :local ifn [:tostr [/ip dhcp-client get \$c interface]]
+    :local adr [:tostr [/ip dhcp-client get \$c add-default-route]]
+    :local cm [:tostr [/ip dhcp-client get \$c comment]]
+    :if (\$adr != "no" && \$adr != "false" && !(\$cm~"^LBW") && !(\$cm~"^PRE-LBW-DIST:")) do={
+      :if ([:len [/interface list member find where list="LBW-WAN" && interface=\$ifn]] = 0) do={
+        :local d [:tostr [/ip dhcp-client get \$c default-route-distance]]
+        :if ([:len \$d] = 0) do={ :set d "1" }
+        /ip dhcp-client set \$c default-route-distance=200 comment=("PRE-LBW-DIST:" . \$d . ":" . \$cm)
+        :log warning ("LBW: ruta por defecto del DHCP de " . \$ifn . " pasa a distancia 200 (era " . \$d . ")")
+      }
+    }
+  }
+} on-error={ :log error "LBW fallo: distancia de otros DHCP client" }
 
 # --- 11. Resumen de lo que quedo instalado ---------------------------
 :do {
@@ -1290,10 +1517,23 @@ RSCHEAD
 :do { /routing table remove [find where comment~"^LBW"] } on-error={ :log error "LBW-remove: tabla en uso" }
 
 # 3b. Enlace con el router de abajo (si lo creo LBW)
-:do { /ip dhcp-server remove [find where comment~"^LBW:link"] } on-error={}
-:do { /ip dhcp-server network remove [find where comment~"^LBW:link"] } on-error={}
-:do { /ip pool remove [find where comment~"^LBW:link"] } on-error={}
-:do { /ip address remove [find where comment~"^LBW:link"] } on-error={}
+:do { /ip dhcp-server remove [find where comment~"^LBW:(link|lan)"] } on-error={}
+:do { /ip dhcp-server network remove [find where comment~"^LBW:(link|lan)"] } on-error={}
+:do { /ip pool remove [find where comment~"^LBW:(link|lan)"] } on-error={}
+:do { /ip address remove [find where comment~"^LBW:(link|lan)"] } on-error={}
+
+# 3c. LAN creada por LBW (bridge-lan): se quita antes de devolver los puertos
+:do { /interface bridge port remove [find where comment~"^LBW:lan"] } on-error={}
+:do { /interface bridge remove [find where comment~"^LBW:lan"] } on-error={}
+
+# 3d. DHCP clients ajenos a los que LBW subio la distancia de su ruta
+:foreach c in=[/ip dhcp-client find where comment~"^PRE-LBW-DIST:"] do={
+  :local cm [/ip dhcp-client get $c comment]
+  :local p [:find $cm ":" 13]
+  :local d [:pick $cm 13 $p]
+  :local rest [:pick $cm ($p + 1) [:len $cm]]
+  :do { /ip dhcp-client set $c default-route-distance=[:tonum $d] comment=$rest } on-error={ /ip dhcp-client set $c comment=$rest }
+}
 
 # 4. DHCP clients: borrar los creados por LBW, restaurar los que ya existian
 :foreach d in=[/ip dhcp-client find where comment~"^LBW"] do={
@@ -1471,6 +1711,11 @@ def scan(path):
             warns.append((n, 1, f"la linea no empieza por / ni por : — ¿continuacion perdida?  >>> {s[:60]}"))
         if ':do {' in s and 'on-error=' not in s and not s.endswith('{'):
             warns.append((n, 1, ":do sin on-error= en la misma linea"))
+
+    # dentro de las cadenas tambien: el script del DHCP client va entre comillas
+    for n, raw in enumerate(src.splitlines(), 1):
+        if re.search(r':tobool\s+\\*\$bound', raw):
+            errs.append((n, 1, "[:tobool $bound] devuelve nil (bound llega como texto): usa ($bound=1) como el ejemplo oficial del DHCP client"))
 
     # coherencia de rutas recursivas: target-scope debe superar el scope del probe
     probes = {}
