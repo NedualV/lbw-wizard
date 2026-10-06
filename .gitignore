@@ -1,0 +1,4 @@
+lbw-[0-9]*.rsc
+pre-lbw.*
+*.backup
+*.old
