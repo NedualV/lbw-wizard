@@ -20,7 +20,7 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
   *) if locale -a 2>/dev/null | grep -qi '^C\.utf8$'; then export LC_ALL=C.UTF-8
      elif locale -a 2>/dev/null | grep -qi '^en_US\.utf8$'; then export LC_ALL=en_US.UTF-8; fi;;
 esac
-VERSION="3.0"
+VERSION="3.1"
 AUTHOR="Nedual Vargas (@NEDUALV)"
 AUTHOR_ASCII="Nedual Vargas (@NEDUALV)"
 REPO_URL="https://github.com/NedualV/lbw-wizard"
@@ -224,6 +224,14 @@ is_port(){ [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 is_num(){ [[ $1 =~ ^[0-9]+$ ]] && (( $1 > 0 )); }
 is_vlan(){ [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 4094 )); }
 is_any(){ [[ -n $1 ]]; }
+is_opt(){ return 0; }
+local_tz(){ # zona horaria de esta PC, para proponerla al router
+  local z=""
+  z=$(timedatectl show -p Timezone --value 2>/dev/null)
+  [[ -z $z && -L /etc/localtime ]] && z=$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')
+  [[ -z $z && -f /etc/timezone ]] && z=$(< /etc/timezone)
+  echo "${z:-America/Santo_Domingo}"
+}
 is_range(){ [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}-([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 ip2int(){ local IFS=. a b c d; read -r a b c d <<< "$1"; echo $(( (a<<24) + (b<<16) + (c<<8) + d )); }
 int2ip(){ echo "$(( ($1>>24)&255 )).$(( ($1>>16)&255 )).$(( ($1>>8)&255 )).$(( $1&255 ))"; }
@@ -231,6 +239,31 @@ cidr_net(){ # 192.168.88.1/24 -> 192.168.88.0/24
   local ip=${1%%/*} len=${1##*/}; [[ $1 == */* ]] || len=32
   local m=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
   echo "$(int2ip $(( $(ip2int "$ip") & m )))/$len"
+}
+used_nets(){ # redes de todas las IP del router + redes de DHCP ya definidas
+  local k out=" "
+  for k in "${!IFADDR[@]}"; do [[ -n ${IFADDR[k]} ]] && out+="$(cidr_net "${IFADDR[k]}") "; done
+  echo "$out${AUDIT_DHCPNETS# }"
+}
+free_link_net(){ # primera /30 que no choque con nada del router
+  local c u; u=$(used_nets)
+  for c in 10.255.255.0/30 10.255.254.0/30 172.31.255.252/30 192.168.255.252/30; do
+    [[ $u != *" $c "* ]] && { echo "$c"; return; }
+  done
+  echo "10.255.253.0/30"
+}
+ip_in_nets(){ # ip_in_nets 192.168.88.5 "10.0.0.0/8,192.168.88.0/24"
+  local ip n len m; ip=$(ip2int "$1")
+  IFS=',' read -ra _nets <<< "$2"
+  for n in "${_nets[@]}"; do
+    [[ $n == */* ]] || n="$n/32"; len=${n##*/}
+    m=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    (( (ip & m) == ($(ip2int "${n%%/*}") & m) )) && return 0
+  done
+  return 1
+}
+host_n(){ # host_n 10.0.0.0/30 1 -> 10.0.0.1
+  echo "$(int2ip $(( $(ip2int "${1%%/*}") + $2 )))"
 }
 cidr_pool(){ # rango DHCP por defecto: de .10 (o .2 en redes chicas) al penultimo, sin el gateway
   local ip=${1%%/*} len=${1##*/} n b gw first last
@@ -324,10 +357,10 @@ rget(){ # baja archivos del router a esta carpeta
   done
 }
 
-BOARD=""; IDENT=""; ROS_VER=""; FWCOUNT=0; ARCH=""; CPUN=0; LICLEVEL=""; IS_CHR=0; IFLIST=(); IFTYPE=(); IFRUN=(); IFADDR=()
+BOARD=""; IDENT=""; ROS_VER=""; FWCOUNT=0; ARCH=""; CPUN=0; LICLEVEL=""; IS_CHR=0; MYIP=""; IFLIST=(); IFTYPE=(); IFRUN=(); IFADDR=()
 detect_router(){
   local raw
-  raw=$(rssh ':put ("BOARD|" . [/system resource get board-name]); :put ("IDENT|" . [/system identity get name]); :put ("VER|" . [/system resource get version]); :put ("FW|" . [:len [/ip firewall filter find]]); :put ("ARCH|" . [/system resource get architecture-name]); :put ("CPUN|" . [/system resource get cpu-count]); :do { :put ("LIC|" . [/system license get level]) } on-error={}; :foreach i in=[/interface find where !disabled] do={ :local n [/interface get $i name]; :local a ""; :foreach x in=[/ip address find where interface=$n] do={ :set a ([/ip address get $x address]) }; :put ("IF|" . $n . "|" . [/interface get $i type] . "|" . [/interface get $i running] . "|" . $a) }' 2>/dev/null | tr -d '\r')
+  raw=$(rssh ':put ("BOARD|" . [/system resource get board-name]); :put ("IDENT|" . [/system identity get name]); :put ("VER|" . [/system resource get version]); :put ("FW|" . [:len [/ip firewall filter find]]); :put ("ARCH|" . [/system resource get architecture-name]); :put ("CPUN|" . [/system resource get cpu-count]); :do { :put ("LIC|" . [/system license get level]) } on-error={}; :do { :local me ""; :foreach u in=[/user active find where via="ssh"] do={ :set me [/user active get $u address] }; :put ("ME|" . $me) } on-error={}; :foreach i in=[/interface find where !disabled] do={ :local n [/interface get $i name]; :local a ""; :foreach x in=[/ip address find where interface=$n] do={ :set a ([/ip address get $x address]) }; :put ("IF|" . $n . "|" . [/interface get $i type] . "|" . [/interface get $i running] . "|" . $a) }' 2>/dev/null | tr -d '\r')
   [[ -z $raw ]] && return 1
   IFLIST=(); IFTYPE=(); IFRUN=(); IFADDR=()
   local l f1 f2 f3 f4 f5
@@ -335,7 +368,7 @@ detect_router(){
     IFS='|' read -r f1 f2 f3 f4 f5 <<< "$l"
     case $f1 in
       BOARD) BOARD=$f2;; IDENT) IDENT=$f2;; VER) ROS_VER=$f2;; FW) FWCOUNT=$f2;;
-      ARCH) ARCH=$f2;; CPUN) CPUN=$f2;; LIC) LICLEVEL=$f2;;
+      ARCH) ARCH=$f2;; CPUN) CPUN=$f2;; LIC) LICLEVEL=$f2;; ME) MYIP=$f2;;
       IF) IFLIST+=("$f2"); IFTYPE+=("$f3"); IFRUN+=("$f4"); IFADDR+=("$f5");;
     esac
   done <<< "$raw"
@@ -373,15 +406,17 @@ probe_link(){ # mira si el puerto del enlace ya tiene IP y servidor DHCP
 
 AUDIT_FT=0; AUDIT_DEFROUTE=0; AUDIT_MANGLE=0; AUDIT_TABLES=""; AUDIT_NAT=0
 AUDIT_HOTSPOT=0; AUDIT_PPPSRV=0; AUDIT_QUEUE=0; AUDIT_ROLLBACK=0; AUDIT_LBW=0
-AUDIT_DHCPSRV=0; AUDIT_FWIN=0; AUDIT_FWFWD=0; AUDIT_DHCPDR=0
+AUDIT_DHCPSRV=0; AUDIT_FWIN=0; AUDIT_FWFWD=0; AUDIT_DHCPDR=0; AUDIT_DHCPNETS=" "
 audit_router(){
   local raw
-  raw=$(rssh ':put ("FT|" . [:len [/ip firewall filter find where action=fasttrack-connection && !disabled]]); :put ("DR|" . [:len [/ip route find where dst-address="0.0.0.0/0" && static]]); :put ("MR|" . [:len [/ip firewall mangle find where action=mark-routing && !(comment~"^LBW")]]); :put ("TB|" . [:len [/routing table find where !(name="main")]]); :put ("NT|" . [:len [/ip firewall nat find where action=masquerade && out-interface-list=""]]); :put ("HS|" . [:len [/ip hotspot find]]); :put ("PS|" . [:len [/interface pppoe-server server find]]); :put ("QS|" . [:len [/queue simple find]]); :put ("RB|" . [:len [/system scheduler find where comment~"ROLLBACK-LBW"]]); :put ("LB|" . [:len [/ip firewall mangle find where comment~"^LBW"]]); :put ("DS|" . [:len [/ip dhcp-server find where !disabled]]); :put ("FI|" . [:len [/ip firewall filter find where chain=input && !dynamic && !disabled]]); :put ("FF|" . [:len [/ip firewall filter find where chain=forward && !dynamic && !disabled]]); :do { :local dd 0; :foreach c in=[/ip dhcp-client find where !disabled] do={ :local v [:tostr [/ip dhcp-client get $c add-default-route]]; :if ($v != "no" && $v != "false") do={ :set dd ($dd + 1) } }; :put ("DD|" . $dd) } on-error={}' 2>/dev/null | tr -d '\r')
+  raw=$(rssh ':put ("FT|" . [:len [/ip firewall filter find where action=fasttrack-connection && !disabled]]); :put ("DR|" . [:len [/ip route find where dst-address="0.0.0.0/0" && static]]); :put ("MR|" . [:len [/ip firewall mangle find where action=mark-routing && !(comment~"^LBW")]]); :put ("TB|" . [:len [/routing table find where !(name="main")]]); :put ("NT|" . [:len [/ip firewall nat find where action=masquerade && out-interface-list=""]]); :put ("HS|" . [:len [/ip hotspot find]]); :put ("PS|" . [:len [/interface pppoe-server server find]]); :put ("QS|" . [:len [/queue simple find]]); :put ("RB|" . [:len [/system scheduler find where comment~"ROLLBACK-LBW"]]); :put ("LB|" . [:len [/ip firewall mangle find where comment~"^LBW"]]); :put ("DS|" . [:len [/ip dhcp-server find where !disabled]]); :put ("FI|" . [:len [/ip firewall filter find where chain=input && !dynamic && !disabled]]); :put ("FF|" . [:len [/ip firewall filter find where chain=forward && !dynamic && !disabled]]); :do { :local dd 0; :foreach c in=[/ip dhcp-client find where !disabled] do={ :local v [:tostr [/ip dhcp-client get $c add-default-route]]; :if ($v != "no" && $v != "false") do={ :set dd ($dd + 1) } }; :put ("DD|" . $dd) } on-error={}; :foreach n in=[/ip dhcp-server network find] do={ :put ("DN|" . [/ip dhcp-server network get $n address]) }' 2>/dev/null | tr -d '\r')
   [[ -z $raw ]] && return 1
   local l a b
+  AUDIT_DHCPNETS=" "
   while IFS= read -r l; do
     IFS='|' read -r a b <<< "$l"
     case $a in
+      DN) AUDIT_DHCPNETS+="$b ";;
       FT) AUDIT_FT=${b:-0};; DR) AUDIT_DEFROUTE=${b:-0};; MR) AUDIT_MANGLE=${b:-0};;
       TB) AUDIT_TABLES=${b:-0};; NT) AUDIT_NAT=${b:-0};; HS) AUDIT_HOTSPOT=${b:-0};;
       PS) AUDIT_PPPSRV=${b:-0};; QS) AUDIT_QUEUE=${b:-0};; RB) AUDIT_ROLLBACK=${b:-0};; LB) AUDIT_LBW=${b:-0};;
@@ -406,6 +441,8 @@ DNS="1.1.1.1,8.8.8.8"; DNSREMOTE="s"; MSSCLAMP="s"; PROTECTWAN="s"
 ROLE="router"; DOWNGW=""; BALIP=""; CLIENTNETS=""; LINKMODE="auto"; LINKNET=""; UPIF="ether1"; LINKDHCP="si"
 TGENABLE="n"; TGTOKEN=""; TGCHAT=""; ROLLBACK_MIN=10; STARTMODE="keep"
 LANMODE="existing"; LANCREATE="n"; LANPORTS=""; LANGW=""; LANPOOL=""
+HARDEN="s"; MGMTNETS=""; PIN="n"; DISKLOG="s"; NTPSET="s"; TZNAME=""
+declare -a WPIN
 OUTNAME="lbw-config.rsc"
 
 gcd(){ local a=$1 b=$2 t; while (( b )); do t=$b; b=$(( a % b )); a=$t; done; echo "$a"; }
@@ -774,13 +811,17 @@ step_lan(){
       q input LANIFS "Interfaz del enlace hacia el router de abajo" "${LANIFS:-ether5}" is_any || return 10
       defnet=""
     fi
-    # IP del enlace: la que ya tenga el puerto, o una por defecto
+    # IP del enlace: la que ya tenga el puerto o, si no tiene, una /30 que no
+    # choque con ninguna red del router (en un hEX de fabrica 192.168.88.0/24
+    # ya esta en el bridge: repetirla rompe la vuelta hacia los clientes).
     if [[ -n $defnet ]]; then
       BALIP=${defnet%%/*}
-      LINKNET=$(awk -F'[./]' '{printf "%s.%s.%s.0/%s", $1,$2,$3,$5}' <<< "$defnet")
-      DOWNGW=$(awk -F. '{printf "%s.%s.%s.2", $1,$2,$3}' <<< "$BALIP")
+      LINKNET=$(cidr_net "$defnet")
+      local bi bb
+      bi=$(ip2int "$BALIP"); bb=$(( $(ip2int "${LINKNET%%/*}") + (1 << (32 - ${LINKNET##*/})) - 1 ))
+      if (( bi + 1 < bb )); then DOWNGW=$(int2ip $(( bi + 1 ))); else DOWNGW=$(int2ip $(( bi - 1 ))); fi
     else
-      BALIP="192.168.88.1"; LINKNET="192.168.88.0/24"; DOWNGW="192.168.88.2"
+      LINKNET=$(free_link_net); BALIP=$(host_n "$LINKNET" 1); DOWNGW=$(host_n "$LINKNET" 2)
     fi
 
     q menu LINKMODE "¿Cómo configuro el enlace con ese router?" 1 \
@@ -801,20 +842,29 @@ step_lan(){
       fi
       box "$CO" "El enlace queda así (no hay que tocar nada)" \
         "Puerto:            $LANIFS" \
-        "Este MikroTik:     $BALIP$([[ ${LINKHASADDR:-0} -gt 0 ]] && echo "  (la que ya tenía)")" \
+        "Este MikroTik:     $BALIP/${LINKNET##*/}$([[ ${LINKHASADDR:-0} -gt 0 ]] && echo "  (la que ya tenía)" || echo "  (red libre en este router)")" \
         "Router de abajo:   $DOWNGW  ($([[ $LINKDHCP == si ]] && echo "se la doy por DHCP" || echo "IP fija en su archivo"))" \
         "Vuelta a clientes: todo lo privado (10.x, 172.16-31.x, 192.168.x) va hacia abajo" \
         "" \
         "Si tus clientes usan IP públicas, elige «Lo configuro yo» y dime las subredes."
       q input UPIF "¿Por qué puerto conecta el router de abajo hacia aquí?" "${UPIF:-ether1}" is_any "Escribe el nombre." "Es el puerto DEL OTRO router. Si no estás seguro deja ether1 y lo cambias en el archivo." || return 10
     else
-      q input BALIP "IP de ESTE MikroTik en ese enlace" "${BALIP}" is_ip "Escribe una IP válida." "Es la que el router de abajo usará como gateway" || return 10
+      local bcidr="$BALIP/${LINKNET##*/}"
+      while true; do
+        q input bcidr "IP de ESTE MikroTik en ese enlace (con máscara)" "$bcidr" is_cidr "Formato: 10.255.255.1/30" "Es la que el router de abajo usará como gateway" || return 10
+        if [[ -z $defnet && $(used_nets) == *" $(cidr_net "$bcidr") "* ]]; then
+          err "La red $(cidr_net "$bcidr") ya está en uso en este router. Elige otra."; continue
+        fi
+        break
+      done
+      BALIP=${bcidr%%/*}; LINKNET=$(cidr_net "$bcidr")
+      if ! ip_in_nets "$DOWNGW" "$LINKNET" || [[ $DOWNGW == "$BALIP" ]]; then DOWNGW=$(int2ip $(( $(ip2int "$BALIP") + 1 ))); fi
       q input DOWNGW "IP del router de abajo en ese enlace" "${DOWNGW}" is_ip "Escribe una IP válida." "Por ahí entran las subredes de clientes" || return 10
       q input CLIENTNETS "Subredes de clientes que hay detrás (separadas por coma)" "${CLIENTNETS:-10.50.0.0/22}" is_any "Formato: 10.50.0.0/22" "Incluye los pools de PPPoE si los usas" || return 10
       LANNETS="$LINKNET,$CLIENTNETS"
       q input UPIF "¿Por qué puerto conecta el router de abajo hacia aquí?" "${UPIF:-ether1}" is_any || return 10
     fi
-    DNSREMOTE="n"
+    DNSREMOTE="keep"
     warn "El router de abajo NO debe hacer NAT: si enmascara, el balanceo por equipo deja de funcionar. Su archivo ya se lo quita."
   else
     # --- Modo todo en uno: la LAN la arma LBW o se usa una que ya existe ---
@@ -907,12 +957,46 @@ step_lan(){
 
 step_extras(){
   screen 6
-  local i
+  local i x mg mgnet def
   HAS_PPPOE=n; for ((i=1; i<=NWAN; i++)); do [[ ${WTYPE[$i]} == pppoe ]] && HAS_PPPOE=y; done
   if [[ $HAS_PPPOE == y ]]; then MSSCLAMP=s
   else q confirm MSSCLAMP "¿Ajustar el MSS de TCP (clamp)?" s || return 10; fi
   q confirm PROTECTWAN "¿Bloquear el acceso al router desde Internet?" s || return 10
   hint "Agrega reglas de firewall que descartan lo que llega por las WAN y no es respuesta a algo que tú pediste."
+
+  # --- Servicios del router
+  q confirm HARDEN "¿Apagar los servicios que no hacen falta?" s || return 10
+  hint "Apaga telnet, ftp, www, api, api-ssl, reverse-proxy, el servidor de bandwidth-test y SMB. Deja SSH y Winbox, pero solo desde las redes de administración. El desinstalador lo devuelve todo."
+  if [[ $HARDEN == s ]]; then
+    def=""
+    if [[ $ROLE == router ]]; then def=$LANNETS; else def=$LINKNET; fi
+    mg=$(mgmt_if)
+    if [[ -n $mg ]]; then mgnet=$(cidr_net "${IFADDR[$(ifidx "$mg")]}"); [[ ",$def," != *",$mgnet,"* ]] && def+=",$mgnet"; fi
+    [[ -n $MYIP ]] && ! ip_in_nets "$MYIP" "$def" && def+=",$MYIP/32"
+    def=${def#,}
+    q input MGMTNETS "Redes desde donde se administra el router (SSH y Winbox)" "${MGMTNETS:-$def}" is_any "Escribe al menos una red." "Incluye tu PC: si te dejas fuera pierdes el acceso (la red de seguridad lo revertiría). ${MYIP:+Tu PC entra desde $MYIP.}" || return 10
+  fi
+
+  # --- Fijar equipos o sitios a una linea (solo con balanceo)
+  if [[ $MODE == lb ]]; then
+    q confirm PIN "¿Fijar equipos o sitios a una línea concreta?" n || return 10
+    hint "Útil para bancos, VoIP, cámaras o un cliente que necesita IP pública fija. Si esa línea cae, el failover igual los mueve. Luego puedes añadir más con: /ip firewall address-list add list=LBW-fijar-WAN1 address=…"
+    if [[ $PIN == s ]]; then
+      for ((i=1; i<=NWAN; i++)); do
+        q input "WPIN[$i]" "Equipos, redes o dominios que siempre salen por ${WNAME[$i]} (coma; vacío = ninguno)" "${WPIN[$i]}" is_opt "" "Ejemplos: 192.168.2.50, 192.168.2.128/27, bancobhd.com.do" || return 10
+        WPIN[$i]=$(tr -d ' ' <<< "${WPIN[$i]}")
+      done
+    fi
+  else PIN=n; fi
+
+  # --- Log en disco, hora y zona horaria
+  q confirm DISKLOG "¿Guardar el log de LBW en el disco del router?" s || return 10
+  hint "El log normal vive en memoria y se borra al reiniciar, justo cuando más hace falta. Se guarda en el archivo lbw-log."
+  q confirm NTPSET "¿Poner la hora por Internet (NTP) y la zona horaria?" s || return 10
+  if [[ $NTPSET == s ]]; then
+    q input TZNAME "Zona horaria" "${TZNAME:-$(local_tz)}" is_any "Formato: America/Santo_Domingo" "Con la hora bien, los eventos del failover se leen sin confusiones." || return 10
+  fi
+
   q confirm TGENABLE "¿Quieres avisos por Telegram cuando una línea caiga?" n || return 10
   if [[ $TGENABLE == s ]]; then
     q input TGTOKEN "Token del bot" "$TGTOKEN" is_any "No puede ir vacío." "Lo obtienes de @BotFather" || return 10
@@ -940,7 +1024,10 @@ step_summary(){
     box "$CA" "Tu configuración" "Modo: $modetxt" \
       "Papel: $([[ $ROLE == router ]] && echo "balanceador y router de la LAN" || echo "solo balanceador, delante de otro router")" "" "${tl[@]}" "" \
       "$([[ $ROLE == router ]] && { [[ $LANCREATE == s ]] && echo "LAN nueva: bridge-lan ($LANPORTS) · $LANGW · DHCP $LANPOOL" || echo "LAN: $LANIFS → $LANNETS"; } || echo "Enlace: $LANIFS · este $BALIP · abajo $DOWNGW · clientes $CLIENTNETS")" \
-      "DNS: $DNS" \
+      "DNS: $DNS$([[ $DNSREMOTE == keep ]] && echo " (el DNS del router para su propia LAN se deja como está)")" \
+      "Servicios: $([[ $HARDEN == s ]] && echo "solo SSH y Winbox desde $MGMTNETS" || echo "sin cambios")" \
+      "Fijados: $( if [[ $PIN == s ]]; then f=""; for ((i=1; i<=NWAN; i++)); do [[ -n ${WPIN[$i]} ]] && f+="${WNAME[$i]}: ${WPIN[$i]}  "; done; echo "${f:-ninguno (listas vacías listas para usar)}"; else echo "no (listas vacías listas para usar)"; fi)" \
+      "Log en disco: $([[ $DISKLOG == s ]] && echo sí || echo no) · Hora: $([[ $NTPSET == s ]] && echo "NTP, $TZNAME" || echo "sin cambios")" \
       "Red de seguridad: $ROLLBACK_MIN minutos"
     [[ $MODE == lb ]] && warn "Se desactiva FastTrack (incompatible con el balanceo): sube el uso de CPU."
     [[ $PROTECTWAN == s ]] && hint "Firewall: arriba se ponen las reglas que aceptan (established, LAN) y abajo las que descartan desde la WAN, para no tapar tus reglas de VPN o port forwards."
@@ -1036,7 +1123,7 @@ MON
 # FINAL, para no tapar reglas que el usuario ya tenga (VPN, port forwards).
 fw_top(){ echo "  :if (\$hasA) do={ /ip firewall filter add $1 place-before=\$anchor } else={ /ip firewall filter add $1 }"; }
 gen_firewall(){
-  [[ $PROTECTWAN != s && $DNSREMOTE != s ]] && return 0
+  [[ $PROTECTWAN != s && $DNSREMOTE == n ]] && return 0
   echo
   echo "# --- 8. Firewall basico (equivalente al defconf de MikroTik) ---------"
   if [[ $PROTECTWAN == s ]]; then
@@ -1059,6 +1146,101 @@ gen_firewall(){
     W '/ip firewall filter add chain=input action=drop protocol=udp dst-port=53 in-interface-list=LBW-WAN comment="LBW:FW:dns-wan-udp"' "fw dns udp"
     W '/ip firewall filter add chain=input action=drop protocol=tcp dst-port=53 in-interface-list=LBW-WAN comment="LBW:FW:dns-wan-tcp"' "fw dns tcp"
   fi
+}
+
+# Servicios: apaga lo que sobra y limita SSH/Winbox. Cada cambio se apunta en
+# la address-list LBW-restore (comentario LBW:svc:...) para que el
+# desinstalador lo devuelva tal cual estaba.
+gen_harden(){
+  [[ $HARDEN == s ]] || return 0
+  local nets; nets=$(tr -d ' ' <<< "$MGMTNETS")
+  cat << RSC
+
+# --- 8c. Servicios del router (solo SSH y Winbox, desde $nets) -------
+:do {
+  :local n 0
+  :foreach s in=[/ip service find] do={
+    :local nm [/ip service get \$s name]
+    :if ((\$nm = "telnet" || \$nm = "ftp" || \$nm = "www" || \$nm = "api" || \$nm = "api-ssl" || \$nm = "reverse-proxy") && ![/ip service get \$s disabled]) do={
+      :set n (\$n + 1)
+      :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . \$n) comment=("LBW:svc:" . \$nm . ":off") } on-error={}
+      /ip service set \$s disabled=yes
+    }
+    :if (\$nm = "ssh" || \$nm = "winbox") do={
+      :local af ""
+      :do {
+        :foreach x in=[/ip service get \$s available-from] do={ :if ([:len \$af] > 0) do={ :set af (\$af . ",") }; :set af (\$af . \$x) }
+      } on-error={
+        :do { :foreach x in=[/ip service get \$s address] do={ :if ([:len \$af] > 0) do={ :set af (\$af . ",") }; :set af (\$af . \$x) } } on-error={}
+      }
+      :set n (\$n + 1)
+      :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . \$n) comment=("LBW:svc:" . \$nm . ":af=" . \$af) } on-error={}
+      :do { /ip service set \$s available-from=$nets } on-error={ /ip service set \$s address=$nets }
+    }
+  }
+  :do {
+    :if ([/tool bandwidth-server get enabled]) do={
+      :do { /ip firewall address-list add list=LBW-restore address=127.0.2.200 comment="LBW:svc:btest:on" } on-error={}
+      /tool bandwidth-server set enabled=no
+    }
+  } on-error={}
+  :do {
+    :local sm [:tostr [/ip smb get enabled]]
+    :if (\$sm != "no" && \$sm != "false") do={
+      :do { /ip firewall address-list add list=LBW-restore address=127.0.2.201 comment=("LBW:svc:smb:" . \$sm) } on-error={}
+      /ip smb set enabled=no
+    }
+  } on-error={}
+  :log warning "LBW: servicios del router endurecidos (solo SSH y Winbox desde $nets)"
+} on-error={ :log error "LBW fallo: endurecer servicios" }
+RSC
+}
+
+gen_disklog_ntp(){
+  if [[ $DISKLOG == s ]]; then
+    cat << 'RSC'
+
+# --- 8d. Log de LBW en disco (sobrevive a los reinicios) -------------
+:do {
+  :if ([:len [/system logging action find where name="lbw-disk"]] = 0) do={
+    :local f "lbw-log"
+    :do { :local d [/system logging action get [find where name="disk"] disk-file-name]; :if ([:pick $d 0 6] = "flash/") do={ :set f "flash/lbw-log" } } on-error={}
+    /system logging action add name=lbw-disk target=disk disk-file-name=$f disk-lines-per-file=2000 disk-file-count=2
+  }
+  :if ([:len [/system logging find where action="lbw-disk"]] = 0) do={
+    :do { /system logging add topics=script action=lbw-disk regex="LBW" } on-error={ /system logging add topics=script action=lbw-disk }
+  }
+} on-error={ :log error "LBW fallo: log en disco" }
+RSC
+  fi
+  if [[ $NTPSET == s ]]; then
+    cat << RSC
+
+# --- 8e. Hora por NTP y zona horaria ($TZNAME) -----------------------
+:do { /system ntp client set enabled=yes servers=time.cloudflare.com,pool.ntp.org } on-error={ :log error "LBW fallo: NTP" }
+:do { /system clock set time-zone-autodetect=no time-zone-name=$TZNAME } on-error={ :log error "LBW fallo: zona horaria $TZNAME" }
+RSC
+  fi
+}
+
+# Script de estado: /system script run lbw-status
+build_status(){
+  local i
+  echo ':put "LBW - estado de las lineas"'
+  echo ':put "--------------------------------------------------------------"'
+  for ((i=1; i<=NWAN; i++)); do
+    cat << MON
+:local st$i "CAIDA   "
+:if ([:len [/ip route find where comment="LBW:WAN$i:OWN" && active]] > 0) do={ :set st$i "EN LINEA" }
+:local gw$i "-"
+:do { :set gw$i [:tostr [/ip route get [:pick [/ip route find where comment="LBW:WAN$i:PROBE"] 0] gateway]] } on-error={}
+:local nc$i [:len [/ip firewall connection find where connection-mark="ISP${i}_conn"]]
+:local fj$i [:len [/ip firewall address-list find where list="LBW-fijar-WAN$i"]]
+:put ("WAN$i  ${WNAME[$i]}  ${WFINAL[$i]}  " . \$st$i . "  gw " . \$gw$i . "  conexiones " . \$nc$i . "  fijados " . \$fj$i)
+MON
+  done
+  echo ':put "--------------------------------------------------------------"'
+  echo ':put ("Ruta por defecto del router: " . [:len [/ip route find where dst-address="0.0.0.0/0" && active && routing-table="main"]] . " activa(s)")'
 }
 
 # W: envuelve un comando para que un fallo NO aborte el import completo
@@ -1084,7 +1266,7 @@ gen_rsc(){
 :do { /ip firewall mangle remove [find where comment~"^LBW"] } on-error={}
 :do { /ip firewall nat remove [find where comment~"^LBW"] } on-error={}
 :do { /ip firewall filter remove [find where comment~"^LBW"] } on-error={}
-:do { /ip firewall address-list remove [find where comment~"^LBW:local"] } on-error={}
+:do { /ip firewall address-list remove [find where comment~"^LBW:(local|fijar)"] } on-error={}
 :do { /ip route remove [find where comment~"^LBW"] } on-error={}
 :do { /routing rule remove [find where comment~"^LBW"] } on-error={}
 :do { /routing table remove [find where comment~"^LBW"] } on-error={}
@@ -1241,20 +1423,25 @@ RSC
     W "/ip firewall address-list add list=LBW-local address=$x comment=\"LBW:local\"" "address-list $x"
   done
   if [[ $ROLE == balancer ]]; then
-    if [[ $LINKMODE == auto ]]; then
-      echo "# Enlace con el router de abajo"
-      echo ":if ([:len [/ip address find where interface=\"$LANIFS\"]] = 0) do={"
-      W "  /ip address add address=$BALIP/${LINKNET##*/} interface=\"$LANIFS\" comment=\"LBW:link\"" "IP del enlace"
-      echo "} else={ :log info \"LBW: $LANIFS ya tenia IP, la respeto\" }"
-      if [[ $LINKDHCP == si ]]; then
-        echo ":if ([:len [/ip dhcp-server find where interface=\"$LANIFS\"]] = 0) do={"
-        W "  /ip pool add name=LBW-link ranges=$DOWNGW-$DOWNGW comment=\"LBW:link\"" "pool del enlace"
-        W "  /ip dhcp-server add name=LBW-link interface=\"$LANIFS\" address-pool=LBW-link disabled=no comment=\"LBW:link\"" "dhcp del enlace"
-        W "  /ip dhcp-server network add address=$LINKNET gateway=$BALIP dns-server=$DNS comment=\"LBW:link\"" "red del enlace"
-        echo "} else={ :log warning \"LBW: $LANIFS ya tenia servidor DHCP; dale IP fija $DOWNGW al router de abajo\" }"
-      else
-        echo "# Ese puerto ya tenia servidor DHCP: el router de abajo lleva IP fija $DOWNGW en su archivo."
-      fi
+    echo "# Enlace con el router de abajo: $LANIFS = $BALIP/${LINKNET##*/} (abajo: $DOWNGW)"
+    echo ":if ([:len [/ip address find where interface=\"$LANIFS\"]] = 0) do={"
+    W "  /ip address add address=$BALIP/${LINKNET##*/} interface=\"$LANIFS\" comment=\"LBW:link\"" "IP del enlace"
+    echo "} else={ :log info \"LBW: $LANIFS ya tenia IP, la respeto\" }"
+    if [[ $LINKMODE == auto && $LINKDHCP == si ]]; then
+      cat << RSC
+:if ([:len [/ip dhcp-server find where name="LBW-link"]] = 0) do={
+  :do { /ip pool add name=LBW-link ranges=$DOWNGW-$DOWNGW comment="LBW:link" } on-error={ :log error "LBW fallo: pool del enlace" }
+  :do { /ip dhcp-server add name=LBW-link interface="$LANIFS" address-pool=LBW-link lease-time=1h disabled=no comment="LBW:link" } on-error={ :log error "LBW fallo: dhcp del enlace" }
+}
+# Sin esta red el router de abajo recibe IP pero NO gateway ni DNS
+:if ([:len [/ip dhcp-server network find where address="$LINKNET"]] = 0) do={
+  :do { /ip dhcp-server network add address=$LINKNET gateway=$BALIP dns-server=$DNS comment="LBW:link" } on-error={ :log error "LBW fallo: red DHCP del enlace" }
+} else={
+  :log error "LBW: ya existe una red DHCP $LINKNET que no es de LBW; el router de abajo puede quedarse sin gateway. Revisa IP > DHCP Server > Networks"
+}
+RSC
+    elif [[ $LINKMODE == auto ]]; then
+      echo "# Ese puerto ya tenia servidor DHCP: el router de abajo lleva IP fija $DOWNGW en su archivo."
     fi
     echo "# Subredes de clientes que viven detras del router de abajo"
     IFS=',' read -ra _cnets <<< "$CLIENTNETS"
@@ -1267,7 +1454,7 @@ RSC
 RSC
   W "/ip firewall address-list add list=LBW-local address=224.0.0.0/4 comment=\"LBW:local\"" "address-list multicast"
   cat << RSC
-:do { /ip dns set servers=$DNS allow-remote-requests=$([[ $DNSREMOTE == s ]] && echo yes || echo no) } on-error={ :log error "LBW fallo: DNS" }
+$(if [[ $DNSREMOTE == keep ]]; then echo "# Modo balanceador: solo los servidores; allow-remote-requests se deja como estaba"; echo ':do { /ip dns set servers='"$DNS"' } on-error={ :log error "LBW fallo: DNS" }'; else echo ':do { /ip dns set servers='"$DNS"' allow-remote-requests='"$([[ $DNSREMOTE == s ]] && echo yes || echo no)"' } on-error={ :log error "LBW fallo: DNS" }'; fi)
 
 # --- 4. Tablas de ruteo ----------------------------------------------
 RSC
@@ -1325,6 +1512,19 @@ RSC
   if [[ $MODE == lb ]]; then
     calc_weights
     b=0
+    echo "# Fijados: equipos (origen) o sitios (destino) que siempre van por una linea."
+    echo "# Las listas pueden estar vacias; agrega con /ip firewall address-list add list=LBW-fijar-WANx address=..."
+    for ((i=1; i<=NWAN; i++)); do
+      if [[ $PIN == s && -n ${WPIN[$i]} ]]; then
+        IFS=',' read -ra _pins <<< "${WPIN[$i]}"
+        for x in "${_pins[@]}"; do
+          [[ -z $x ]] && continue
+          W "/ip firewall address-list add list=LBW-fijar-WAN$i address=$x comment=\"LBW:fijar\"" "fijar $x"
+        done
+      fi
+      W "/ip firewall mangle add chain=prerouting action=mark-connection in-interface-list=LBW-LAN connection-mark=no-mark src-address-list=LBW-fijar-WAN$i dst-address-list=!LBW-local dst-address-type=!local new-connection-mark=ISP${i}_conn passthrough=yes comment=\"LBW:FIJAR:WAN$i:equipo\"" "fijar equipos WAN$i"
+      W "/ip firewall mangle add chain=prerouting action=mark-connection in-interface-list=LBW-LAN connection-mark=no-mark dst-address-list=LBW-fijar-WAN$i dst-address-type=!local new-connection-mark=ISP${i}_conn passthrough=yes comment=\"LBW:FIJAR:WAN$i:sitio\"" "fijar sitios WAN$i"
+    done
     echo "# PCC: $TOTBUCKETS partes repartidas segun la velocidad de cada linea"
     for ((i=1; i<=NWAN; i++)); do
       for ((k=0; k<${WEIGHT[$i]}; k++)); do
@@ -1347,6 +1547,8 @@ RSC
 :do { /ip firewall nat add chain=srcnat action=masquerade out-interface-list=LBW-WAN ipsec-policy=out,none comment="LBW:NAT" } on-error={ :log error "LBW fallo: NAT" }
 RSC
   gen_firewall
+  gen_harden
+  gen_disklog_ntp
 
   local hasdhcp=n
   for ((i=1; i<=NWAN; i++)); do [[ ${WTYPE[$i]} == dhcp ]] && hasdhcp=y; done
@@ -1381,6 +1583,11 @@ RSC
 $(build_monitor)
   }
 } on-error={ :log error "LBW fallo: script monitor" }
+:do {
+  /system script add name=lbw-status comment="LBW: estado - /system script run lbw-status" source={
+$(build_status)
+  }
+} on-error={ :log error "LBW fallo: script de estado" }
 :do { /system scheduler add name=lbw-monitor interval=10s comment="LBW: monitor" on-event="/system script run lbw-monitor" } on-error={ :log error "LBW fallo: scheduler monitor" }
 
 # --- 10. Ahora si: apartar lo viejo que estorba ----------------------
@@ -1442,51 +1649,136 @@ gen_router2(){
 # LBW Wizard (c) 2026 $AUTHOR_ASCII - GPL-3.0-or-later - $REPO_URL
 #
 # Aplicar EN EL ROUTER DE ABAJO:  /import file-name=lbw-router2.rsc verbose=yes
+# Revertir:                       /import file-name=lbw-router2-remove.rsc verbose=yes
 #
 # Este router NO debe hacer NAT: el unico NAT del camino es el del balanceador.
 # Si enmascara, todas las conexiones llegan arriba con una sola IP de origen
 # y el reparto por equipo deja de funcionar.
+#
+# Enlace: este router = $DOWNGW/${LINKNET##*/} en $UPIF, balanceador = $BALIP
+# Si el puerto hacia el balanceador NO es $UPIF, reemplaza "$UPIF" en todo este archivo.
 # =====================================================================
 :log warning "LBW: preparando router de abajo (ruteo puro)"
 
-# 1. Salida por el balanceador
-#    El puerto de ESTE router hacia el balanceador es: $UPIF
-#    Si no es ese, cambialo en las dos lineas de abajo antes de importar.
-:do { /ip route remove [find where dst-address="0.0.0.0/0" && static] } on-error={}
-$(if [[ $LINKMODE == auto && $LINKDHCP == si ]]; then cat << AUTO
-:do { /ip dhcp-client add interface="$UPIF" add-default-route=yes use-peer-dns=yes comment="LBW:uplink" } on-error={
-  :do { /ip dhcp-client set [find where interface="$UPIF"] add-default-route=yes use-peer-dns=yes comment="LBW:uplink" } on-error={ :log error "LBW fallo: dhcp-client uplink" }
-}
-# El balanceador le entrega $DOWNGW y la ruta por defecto hacia $BALIP.
-# Si prefieres IP fija, comenta lo de arriba y usa estas dos lineas:
-# /ip address add address=$DOWNGW/${LINKNET##*/} interface="$UPIF" comment="LBW:uplink"
-# /ip route add dst-address=0.0.0.0/0 gateway=$BALIP comment="LBW:uplink"
-AUTO
-else cat << MANU
-# Comprueba que $DOWNGW no caiga dentro de un pool DHCP del balanceador.
-:do { /ip address add address=$DOWNGW/${LINKNET##*/} interface="$UPIF" comment="LBW:uplink" } on-error={}
-:do { /ip route add dst-address=0.0.0.0/0 gateway=$BALIP comment="LBW:uplink al balanceador" } on-error={ :log error "LBW fallo: ruta por defecto" }
-MANU
-fi)
+# 1. Apartar cualquier otra salida a Internet (todo se marca PRE-LBW y el
+#    desinstalador lo devuelve): rutas por defecto fijas, y DHCP/PPPoE client
+#    que instalen su propia ruta por defecto.
+:do {
+  :foreach r in=[/ip route find where dst-address="0.0.0.0/0" && static && !disabled && !(comment~"^LBW")] do={
+    :local c [:tostr [/ip route get \$r comment]]
+    /ip route set \$r disabled=yes comment=("PRE-LBW:" . \$c)
+  }
+} on-error={ :log error "LBW fallo: apartar rutas por defecto" }
+:do {
+  :foreach c in=[/ip dhcp-client find] do={
+    :local ifn [:tostr [/ip dhcp-client get \$c interface]]
+    :local adr [:tostr [/ip dhcp-client get \$c add-default-route]]
+    :local cm [:tostr [/ip dhcp-client get \$c comment]]
+    :if (\$ifn != "$UPIF" && \$adr != "no" && \$adr != "false" && !(\$cm~"LBW")) do={
+      /ip dhcp-client set \$c add-default-route=no comment=("PRE-LBW-ADR:" . \$cm)
+      :log warning ("LBW: DHCP client de " . \$ifn . " ya no instala ruta por defecto")
+    }
+  }
+} on-error={ :log error "LBW fallo: apartar otros DHCP client" }
+:do {
+  :foreach c in=[/interface pppoe-client find where add-default-route=yes] do={
+    :local cm [:tostr [/interface pppoe-client get \$c comment]]
+    /interface pppoe-client set \$c add-default-route=no comment=("PRE-LBW-ADR:" . \$cm)
+  }
+} on-error={}
 
-# 2. Fuera NAT: el balanceador es quien enmascara
+# 2. Salida por el balanceador
+RSC
+  if [[ $LINKMODE == auto && $LINKDHCP == si ]]; then
+    cat << RSC
+:do {
+  :local done false
+  :foreach c in=[/ip dhcp-client find] do={
+    :if ([:tostr [/ip dhcp-client get \$c interface]] = "$UPIF") do={
+      :local cm [:tostr [/ip dhcp-client get \$c comment]]
+      :if (!(\$cm~"^LBW")) do={ :set cm ("LBW:uplink-prev:" . \$cm) }
+      /ip dhcp-client set \$c add-default-route=yes use-peer-dns=yes disabled=no comment=\$cm
+      :set done true
+    }
+  }
+  :if (!\$done) do={ /ip dhcp-client add interface="$UPIF" add-default-route=yes use-peer-dns=yes disabled=no comment="LBW:uplink" }
+} on-error={ :log error "LBW fallo: dhcp-client hacia el balanceador" }
+# El balanceador le entrega $DOWNGW, la ruta por defecto hacia $BALIP y el DNS.
+RSC
+  else
+    cat << RSC
+:do { /ip address add address=$DOWNGW/${LINKNET##*/} interface="$UPIF" comment="LBW:uplink" } on-error={ :log warning "LBW: $DOWNGW ya estaba puesta" }
+:do { /ip route add dst-address=0.0.0.0/0 gateway=$BALIP comment="LBW:uplink al balanceador" } on-error={ :log error "LBW fallo: ruta por defecto" }
+:do { /ip dns set servers=$DNS } on-error={}
+RSC
+  fi
+  cat << 'RSC'
+
+# 3. Fuera NAT: el balanceador es quien enmascara
 :do {
   :foreach r in=[/ip firewall nat find where action=masquerade && !disabled] do={
-    :local c [/ip firewall nat get \$r comment]
-    /ip firewall nat set \$r disabled=yes comment=("PRE-LBW:" . \$c)
+    :local c [:tostr [/ip firewall nat get $r comment]]
+    /ip firewall nat set $r disabled=yes comment=("PRE-LBW:" . $c)
   }
 } on-error={ :log error "LBW fallo: apartar NAT" }
 
-# 3. FastTrack fuera: se salta las colas y el conteo de trafico
+# 4. FastTrack fuera: se salta las colas y el conteo de trafico
 :do {
   :foreach r in=[/ip firewall filter find where action=fasttrack-connection && !disabled] do={
-    :local c [/ip firewall filter get \$r comment]
-    /ip firewall filter set \$r disabled=yes comment=("PRE-LBW:" . \$c)
+    :local c [:tostr [/ip firewall filter get $r comment]]
+    /ip firewall filter set $r disabled=yes comment=("PRE-LBW:" . $c)
   }
 } on-error={ :log error "LBW fallo: fasttrack" }
 
 :log warning "LBW: router de abajo listo. Las colas simples siguen funcionando igual."
-:put "Listo. Comprueba: /ip route print  y  /queue simple print stats"
+:put "Listo. Comprueba: /ip dhcp-client print  /ip route print where dst-address=0.0.0.0/0  /queue simple print stats"
+RSC
+}
+
+gen_router2_remove(){
+  echo "# LBW - desinstalador del router de ABAJO - lbw-wizard.sh v$VERSION"
+  echo "# LBW Wizard (c) 2026 $AUTHOR_ASCII - GPL-3.0-or-later - $REPO_URL"
+  cat << 'RSC'
+# Uso EN EL ROUTER DE ABAJO: /import file-name=lbw-router2-remove.rsc verbose=yes
+:log warning "LBW: revirtiendo router de abajo"
+
+# 1. Lo que LBW agrego hacia el balanceador
+:do { /ip dhcp-client remove [find where comment="LBW:uplink"] } on-error={}
+:do { /ip route remove [find where comment~"^LBW:uplink"] } on-error={}
+:do { /ip address remove [find where comment="LBW:uplink"] } on-error={}
+:foreach c in=[/ip dhcp-client find where comment~"^LBW:uplink-prev:"] do={
+  :local cm [/ip dhcp-client get $c comment]
+  /ip dhcp-client set $c comment=[:pick $cm 16 [:len $cm]]
+}
+
+# 2. Devolver las otras salidas que se apartaron
+:foreach c in=[/ip dhcp-client find where comment~"^PRE-LBW-ADR:"] do={
+  :local cm [/ip dhcp-client get $c comment]
+  /ip dhcp-client set $c add-default-route=yes comment=[:pick $cm 12 [:len $cm]]
+}
+:do {
+  :foreach c in=[/interface pppoe-client find where comment~"^PRE-LBW-ADR:"] do={
+    :local cm [/interface pppoe-client get $c comment]
+    /interface pppoe-client set $c add-default-route=yes comment=[:pick $cm 12 [:len $cm]]
+  }
+} on-error={}
+:foreach r in=[/ip route find where comment~"^PRE-LBW:"] do={
+  :local c [/ip route get $r comment]
+  /ip route set $r disabled=no comment=[:pick $c 8 [:len $c]]
+}
+
+# 3. NAT y FastTrack de vuelta
+:foreach r in=[/ip firewall nat find where comment~"^PRE-LBW:"] do={
+  :local c [/ip firewall nat get $r comment]
+  /ip firewall nat set $r disabled=no comment=[:pick $c 8 [:len $c]]
+}
+:foreach r in=[/ip firewall filter find where comment~"^PRE-LBW:"] do={
+  :local c [/ip firewall filter get $r comment]
+  /ip firewall filter set $r disabled=no comment=[:pick $c 8 [:len $c]]
+}
+
+:log warning "LBW: router de abajo revertido"
+:put "LBW: router de abajo revertido."
 RSC
 }
 
@@ -1509,7 +1801,7 @@ RSCHEAD
 :do { /ip firewall raw remove [find where comment~"^LBW"] } on-error={}
 :do { /ip firewall nat remove [find where comment~"^LBW"] } on-error={ :log error "LBW-remove: nat" }
 :do { /ip firewall filter remove [find where comment~"^LBW"] } on-error={ :log error "LBW-remove: filter" }
-:do { /ip firewall address-list remove [find where comment~"^LBW:local"] } on-error={}
+:do { /ip firewall address-list remove [find where comment~"^LBW:(local|fijar)"] } on-error={}
 
 # 3. Rutas y reglas antes que las tablas
 :do { /ip route remove [find where comment~"^LBW"] } on-error={ :log error "LBW-remove: rutas" }
@@ -1595,6 +1887,27 @@ RSCHEAD
   :local c [/ip firewall mangle get $r comment]
   /ip firewall mangle set $r disabled=no comment=[:pick $c 8 [:len $c]]
 }
+
+# 6b. Servicios del router como estaban antes de LBW
+:foreach a in=[/ip firewall address-list find where comment~"^LBW:svc:"] do={
+  :local c [/ip firewall address-list get $a comment]
+  :local r [:pick $c 8 [:len $c]]
+  :local p [:find $r ":"]
+  :local nm [:pick $r 0 $p]
+  :local v [:pick $r ($p + 1) [:len $r]]
+  :if ($nm = "btest") do={ :do { /tool bandwidth-server set enabled=yes } on-error={} }
+  :if ($nm = "smb") do={ :do { /ip smb set enabled=$v } on-error={} }
+  :if ($nm != "btest" && $nm != "smb" && $v = "off") do={ :do { /ip service set [find where name=$nm] disabled=no } on-error={} }
+  :if ([:pick $v 0 3] = "af=") do={
+    :local af [:pick $v 3 [:len $v]]
+    :do { /ip service set [find where name=$nm] available-from=$af } on-error={ :do { /ip service set [find where name=$nm] address=$af } on-error={} }
+  }
+}
+:do { /ip firewall address-list remove [find where comment~"^LBW:svc:"] } on-error={}
+
+# 6c. Log en disco de LBW (los archivos lbw-log se conservan como historial)
+:do { /system logging remove [find where action="lbw-disk"] } on-error={}
+:do { /system logging action remove [find where name="lbw-disk"] } on-error={}
 
 # 7. Variables globales del monitor
 :do { /system script environment remove [find where name~"^LBW"] } on-error={}
@@ -1766,7 +2079,7 @@ def scan(path):
     alists = set(re.findall(r'/ip firewall address-list add list=([\w-]+)', src))
     for n, code in code_lines:
         for m in re.finditer(r'address-list=!?([\w-]+)', code):
-            if m.group(1) not in alists and not code.lstrip().startswith('/ip firewall address-list'):
+            if m.group(1) not in alists and not m.group(1).startswith('LBW-fijar-') and not code.lstrip().startswith('/ip firewall address-list'):
                 errs.append((n, 1, f"address-list {m.group(1)} usada sin crearse"))
     # PCC: todos los restos cubiertos una sola vez
     buckets = {}
@@ -1814,11 +2127,11 @@ LBWCHECKER
 OUTNAME="lbw-$(date '+%m%d-%H%M').rsc"
 gen_rsc > "$OUTNAME"
 gen_remove > lbw-remove.rsc
-[[ $ROLE == balancer ]] && gen_router2 > lbw-router2.rsc
+[[ $ROLE == balancer ]] && { gen_router2 > lbw-router2.rsc; gen_router2_remove > lbw-router2-remove.rsc; }
 echo
 ok "Generado ${BOLD}$OUTNAME${N} ($(wc -l < "$OUTNAME") líneas) y ${BOLD}lbw-remove.rsc${N}"
-[[ $ROLE == balancer ]] && ok "Generado también ${BOLD}lbw-router2.rsc${N} para el router de abajo"
-if ! validate_rsc "$OUTNAME" lbw-remove.rsc $([[ $ROLE == balancer ]] && echo lbw-router2.rsc); then
+[[ $ROLE == balancer ]] && ok "Generado también ${BOLD}lbw-router2.rsc${N} y ${BOLD}lbw-router2-remove.rsc${N} para el router de abajo"
+if ! validate_rsc "$OUTNAME" lbw-remove.rsc $([[ $ROLE == balancer ]] && echo lbw-router2.rsc lbw-router2-remove.rsc); then
   err "No subo nada al router con esto así. Repórtalo en $REPO_URL/issues con el .rsc adjunto."
   exit 1
 fi
@@ -1929,6 +2242,8 @@ box "$CB" "Comandos útiles" \
   "Ver rutas:    /ip route print where comment~\"LBW\"" \
   "Ver eventos:  /log print where message~\"LBW\"" \
   "Ver reparto:  /ip firewall mangle print stats where comment~\"PCC\"" \
+  "Estado:       /system script run lbw-status" \
+  "Fijar algo:   /ip firewall address-list add list=LBW-fijar-WAN1 address=…" \
   "Simular caída de ${WNAME[1]}:" \
   "   /ip route disable [find where comment=\"LBW:WAN1:PROBE\"]" \
   "Desinstalar:  /import file-name=lbw-remove.rsc"
@@ -1937,6 +2252,7 @@ if [[ $ROLE == balancer ]]; then
   box "$CW" "Falta el router de abajo" \
     "Sube lbw-router2.rsc a ESE router y aplícalo:" \
     "   /import file-name=lbw-router2.rsc verbose=yes" \
+    "Para revertirlo: /import file-name=lbw-router2-remove.rsc verbose=yes" \
     "Le pone la ruta por defecto hacia $BALIP, le quita el NAT y el FastTrack." \
     "Sus colas simples siguen igual: clasifican por IP de cliente." \
     "Si usas queue tree con packet-marks en prerouting, revisa que tus reglas" \
