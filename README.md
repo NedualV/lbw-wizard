@@ -1,5 +1,17 @@
 # LBW Wizard — Multi-WAN para MikroTik RouterOS v7
 
+## Así se ve
+
+![LBW Wizard](docs/01-banner.png)
+
+El asistente va paso a paso, en español, explicando cada decisión en lugar de pedir datos técnicos sueltos.
+
+| | |
+|---|---|
+| ![Paso 1](docs/02-paso1-router.png) | ![Paso 2](docs/03-paso2-modo.png) |
+| ![Paso 3](docs/04-paso3-proveedores.png) | ![Paso 4](docs/05-paso4-reparto.png) |
+| ![Paso 5](docs/06-paso5-papel.png) | ![Paso 7](docs/07-paso7-resumen.png) |
+
 Asistente interactivo que genera la configuración de **balanceo de carga (PCC) + failover recursivo** para routers MikroTik con 2 a 6 proveedores de Internet. Pregunta todo paso a paso y genera un `.rsc` listo para importar, más su desinstalador.
 
 > Creado por **Nedual Vargas** ([@NEDUALV](https://youtube.com/@NEDUALV))
