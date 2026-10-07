@@ -14,13 +14,25 @@
 #
 #  SPDX-License-Identifier: GPL-3.0-or-later
 # =====================================================================
+# --- bash 4 o superior. Este bloque funciona tambien en bash 3 y en sh, para
+# --- que el aviso salga en vez de un error raro mas adelante.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "LBW Wizard es un script de bash: ejecutalo con  bash $0" >&2
+  exit 1
+fi
+case $BASH_VERSION in
+  [0-3].*)
+    echo "LBW Wizard necesita bash 4 o superior (tienes $BASH_VERSION)." >&2
+    echo "En macOS: brew install bash  y luego ejecutalo con  \$(brew --prefix)/bin/bash $0" >&2
+    exit 1;;
+esac
 set -o pipefail
 case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
   *UTF-8*|*utf8*) :;;
   *) if locale -a 2>/dev/null | grep -qi '^C\.utf8$'; then export LC_ALL=C.UTF-8
      elif locale -a 2>/dev/null | grep -qi '^en_US\.utf8$'; then export LC_ALL=en_US.UTF-8; fi;;
 esac
-VERSION="3.1.2"
+VERSION="3.2"
 AUTHOR="Nedual Vargas (@NEDUALV)"
 AUTHOR_ASCII="Nedual Vargas (@NEDUALV)"
 REPO_URL="https://github.com/NedualV/lbw-wizard"
@@ -164,6 +176,10 @@ menu(){ # var "titulo" default "valor|etiqueta|descripcion"...
   local -a V L D; local o a b d
   for o in "$@"; do IFS='|' read -r a b d <<< "$o"; V+=("$a"); L+=("$b"); D+=("$d"); done
   local n=${#V[@]} cur=$(( def - 1 )) i k k2 sub
+  if (( ${PREFILL:-0} )); then
+    local pv=${!__v-}
+    for ((i=0; i<n; i++)); do [[ -n $pv && ${V[i]} == "$pv" ]] && { cur=$i; def=$((i+1)); break; }; done
+  fi
   if ((!TTY)); then
     echo "${M}${BOLD}$title${N}"
     for ((i=0; i<n; i++)); do echo "${M}  $((i+1))) ${L[i]}"; done
@@ -328,6 +344,141 @@ run(){ # "mensaje" comando...
   return $rc
 }
 
+# ============================ Requisitos =============================
+# Se comprueban al arrancar. Si todo esta, una linea y seguimos. Si falta
+# algo, se explica para que sirve y se ofrece instalarlo con el gestor de
+# paquetes del sistema, siempre con confirmacion (nunca sudo a escondidas).
+REQ_NEED=(ssh scp awk sed grep tput mktemp)
+REQ_OPT=(python3 sshpass)
+PKGM=""
+SCP_O=(-O)
+req_desc(){
+  case $1 in
+    ssh) echo "conectarse al router";;
+    scp) echo "subir y bajar archivos del router";;
+    awk|sed|grep|mktemp) echo "procesar textos y archivos";;
+    tput) echo "medir la pantalla";;
+    python3) echo "validar el .rsc antes de subirlo";;
+    sshpass) echo "escribir la contraseña del router una sola vez";;
+  esac
+}
+pkg_manager(){
+  PKGM=""
+  # Sistemas inmutables (Silverblue, Kinoite, Bazzite…): el sistema base se
+  # cambia con rpm-ostree; dnf solo instalaria dentro de un toolbox.
+  if [[ -e /run/ostree-booted ]] && command -v rpm-ostree >/dev/null 2>&1; then PKGM=rpm-ostree; return 0; fi
+  local m
+  for m in dnf yum apt-get pacman zypper apk xbps-install brew; do
+    command -v "$m" >/dev/null 2>&1 && { PKGM=$m; return 0; }
+  done
+  return 1
+}
+pkg_name(){ # comando -> paquete, segun PKGM
+  case "$PKGM:$1" in
+    dnf:ssh|dnf:scp|yum:ssh|yum:scp|rpm-ostree:ssh|rpm-ostree:scp|zypper:ssh|zypper:scp) echo openssh-clients;;
+    apt-get:ssh|apt-get:scp|apk:ssh|apk:scp) echo openssh-client;;
+    *:ssh|*:scp) echo openssh;;
+    *:awk) echo gawk;;
+    *:sed) echo sed;;
+    *:grep) echo grep;;
+    apt-get:tput) echo ncurses-bin;;
+    zypper:tput) echo ncurses-utils;;
+    *:tput) echo ncurses;;
+    *:mktemp) echo coreutils;;
+    pacman:python3|brew:python3) echo python;;
+    *:python3) echo python3;;
+    brew:sshpass) echo hudochenkov/sshpass/sshpass;;
+    *:sshpass) echo sshpass;;
+  esac
+}
+priv(){ # prefijo para ser root: nada, sudo o doas
+  [[ $PKGM == brew || ${EUID:-$(id -u)} -eq 0 ]] && return 0
+  if command -v sudo >/dev/null 2>&1; then echo "sudo "
+  elif command -v doas >/dev/null 2>&1; then echo "doas "
+  else return 1; fi
+}
+pkg_cmd(){ # paquetes... -> comando de instalacion
+  local s; s=$(priv) || s=""
+  case $PKGM in
+    dnf) echo "${s}dnf install -y $*";;
+    yum) echo "${s}yum install -y $*";;
+    rpm-ostree) echo "${s}rpm-ostree install $*";;
+    apt-get) echo "${s}apt-get update && ${s}apt-get install -y $*";;
+    pacman) echo "${s}pacman -S --needed --noconfirm $*";;
+    zypper) echo "${s}zypper --non-interactive install $*";;
+    apk) echo "${s}apk add $*";;
+    xbps-install) echo "${s}xbps-install -Sy $*";;
+    brew) echo "brew install $*";;
+  esac
+}
+scp_probe(){ # scp -O solo existe desde OpenSSH 9: si no lo entiende, se quita
+  SCP_O=(-O)
+  command -v scp >/dev/null 2>&1 || return 0
+  local o; o=$(scp -O 2>&1)
+  case $o in *"illegal option"*|*"unknown option"*|*"invalid option"*) SCP_O=();; esac
+  return 0
+}
+check_reqs(){
+  local c miss_n miss_o lines pk cmd choice
+  while true; do
+    miss_n=(); miss_o=()
+    for c in "${REQ_NEED[@]}"; do command -v "$c" >/dev/null 2>&1 || miss_n+=("$c"); done
+    for c in "${REQ_OPT[@]}"; do command -v "$c" >/dev/null 2>&1 || miss_o+=("$c"); done
+    scp_probe
+    if (( ${#miss_n[@]} + ${#miss_o[@]} == 0 )); then
+      ok "Requisitos OK: bash ${BASH_VERSION%%(*}, ssh, scp$( ((${#SCP_O[@]})) || echo " (sin -O)"), python3 y sshpass."
+      return 0
+    fi
+    lines=()
+    for c in "${miss_n[@]}"; do lines+=("✖ $(pad "$c" 9) necesario    · $(req_desc "$c")"); done
+    for c in "${miss_o[@]}"; do lines+=("• $(pad "$c" 9) recomendado  · $(req_desc "$c")"); done
+    box "$([[ ${#miss_n[@]} -gt 0 ]] && echo "$CE" || echo "$CW")" "Faltan programas en esta PC" "${lines[@]}"
+    if ! pkg_manager; then
+      hint "No reconozco el gestor de paquetes de este sistema (dnf, yum, apt, pacman, zypper, apk, xbps, rpm-ostree o brew). Instala a mano: ${miss_n[*]} ${miss_o[*]}"
+      (( ${#miss_n[@]} )) && exit 1
+      return 0
+    fi
+    pk=""
+    for c in "${miss_n[@]}" "${miss_o[@]}"; do
+      [[ " $pk " == *" $(pkg_name "$c") "* ]] || pk+="${pk:+ }$(pkg_name "$c")"
+    done
+    cmd=$(pkg_cmd $pk)
+    say "Comando para instalarlos:"
+    say "   ${CA}$cmd${N}"
+    [[ $PKGM == rpm-ostree ]] && hint "Sistema inmutable: rpm-ostree deja los programas listos para el próximo arranque; hay que reiniciar para usarlos."
+    [[ $PKGM == yum ]] && hint "En CentOS/RHEL 7, sshpass viene del repositorio EPEL (sudo yum install -y epel-release)."
+    if (( !TTY )); then
+      if (( ${#miss_n[@]} )); then err "Sin terminal interactiva no instalo nada. Ejecuta el comando de arriba y vuelve a correr el asistente."; exit 1; fi
+      warn "Sigo sin los recomendados."; return 0
+    fi
+    if ! priv >/dev/null; then
+      err "No hay sudo ni doas en este sistema: instálalos como root con el comando de arriba."
+      (( ${#miss_n[@]} )) && exit 1
+      return 0
+    fi
+    local opts=("install|Instalarlos ahora|Ejecuta el comando de arriba; puede pedirte tu contraseña de usuario")
+    (( ${#miss_n[@]} == 0 )) && opts+=("skip|Seguir sin los recomendados|$( [[ " ${miss_o[*]} " == *" python3 "* ]] && echo "Sin python3 no se valida el .rsc antes de subirlo." ) $( [[ " ${miss_o[*]} " == *" sshpass "* ]] && echo "Sin sshpass escribirás la contraseña en cada conexión." )")
+    opts+=("quit|Salir|")
+    menu choice "¿Qué hacemos?" 1 "${opts[@]}"
+    case $choice in
+      install)
+        echo
+        if bash -c "$cmd"; then
+          hash -r
+          if [[ $PKGM == rpm-ostree ]]; then
+            ok "Instalado. En un sistema inmutable se activa al reiniciar."
+            if (( ${#miss_n[@]} )); then info "Reinicia el equipo y vuelve a ejecutar el asistente."; exit 0; fi
+            info "Sigo sin los recomendados hasta que reinicies."; return 0
+          fi
+          ok "Instalación terminada. Vuelvo a comprobar."
+        else err "La instalación falló. Revisa el mensaje de arriba."; fi
+        echo;;
+      skip) return 0;;
+      quit) exit 0;;
+    esac
+  done
+}
+
 # ============================ SSH ====================================
 RHOST=""; RUSER="admin"; RPORT="22"; DETECTED=0
 SSHOPT=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o LogLevel=ERROR)
@@ -340,9 +491,9 @@ rssh(){
 }
 rscp(){
   if command -v sshpass >/dev/null 2>&1 && [[ -n ${SSHPASS:-} ]]; then
-    sshpass -e scp "${SSHOPT[@]}" -O -P "$RPORT" "$@" "$RUSER@$RHOST:/"
+    sshpass -e scp "${SSHOPT[@]}" "${SCP_O[@]}" -P "$RPORT" "$@" "$RUSER@$RHOST:/"
   else
-    scp "${SSHOPT[@]}" -O -P "$RPORT" "$@" "$RUSER@$RHOST:/"
+    scp "${SSHOPT[@]}" "${SCP_O[@]}" -P "$RPORT" "$@" "$RUSER@$RHOST:/"
   fi
 }
 
@@ -350,9 +501,9 @@ rget(){ # baja archivos del router a esta carpeta
   local f
   for f in "$@"; do
     if command -v sshpass >/dev/null 2>&1 && [[ -n ${SSHPASS:-} ]]; then
-      sshpass -e scp "${SSHOPT[@]}" -O -P "$RPORT" "$RUSER@$RHOST:$f" . || return 1
+      sshpass -e scp "${SSHOPT[@]}" "${SCP_O[@]}" -P "$RPORT" "$RUSER@$RHOST:$f" . || return 1
     else
-      scp "${SSHOPT[@]}" -O -P "$RPORT" "$RUSER@$RHOST:$f" . || return 1
+      scp "${SSHOPT[@]}" "${SCP_O[@]}" -P "$RPORT" "$RUSER@$RHOST:$f" . || return 1
     fi
   done
 }
@@ -407,16 +558,18 @@ probe_link(){ # mira si el puerto del enlace ya tiene IP y servidor DHCP
 AUDIT_FT=0; AUDIT_DEFROUTE=0; AUDIT_MANGLE=0; AUDIT_TABLES=""; AUDIT_NAT=0
 AUDIT_HOTSPOT=0; AUDIT_PPPSRV=0; AUDIT_QUEUE=0; AUDIT_ROLLBACK=0; AUDIT_LBW=0
 AUDIT_DHCPSRV=0; AUDIT_FWIN=0; AUDIT_FWFWD=0; AUDIT_DHCPDR=0; AUDIT_DHCPNETS=" "
+AUDIT_LBWSCRIPT=0; AUDIT_PROFILE=""
 audit_router(){
   local raw
-  raw=$(rssh ':put ("FT|" . [:len [/ip firewall filter find where action=fasttrack-connection && !disabled]]); :put ("DR|" . [:len [/ip route find where dst-address="0.0.0.0/0" && static]]); :put ("MR|" . [:len [/ip firewall mangle find where action=mark-routing && !(comment~"^LBW")]]); :put ("TB|" . [:len [/routing table find where !(name="main")]]); :put ("NT|" . [:len [/ip firewall nat find where action=masquerade && out-interface-list=""]]); :put ("HS|" . [:len [/ip hotspot find]]); :put ("PS|" . [:len [/interface pppoe-server server find]]); :put ("QS|" . [:len [/queue simple find]]); :put ("RB|" . [:len [/system scheduler find where comment~"ROLLBACK-LBW"]]); :put ("LB|" . [:len [/ip firewall mangle find where comment~"^LBW"]]); :put ("DS|" . [:len [/ip dhcp-server find where !disabled]]); :put ("FI|" . [:len [/ip firewall filter find where chain=input && !dynamic && !disabled]]); :put ("FF|" . [:len [/ip firewall filter find where chain=forward && !dynamic && !disabled]]); :do { :local dd 0; :foreach c in=[/ip dhcp-client find where !disabled] do={ :local v [:tostr [/ip dhcp-client get $c add-default-route]]; :if ($v != "no" && $v != "false") do={ :set dd ($dd + 1) } }; :put ("DD|" . $dd) } on-error={}; :foreach n in=[/ip dhcp-server network find] do={ :put ("DN|" . [/ip dhcp-server network get $n address]) }' 2>/dev/null | tr -d '\r')
+  raw=$(rssh ':put ("FT|" . [:len [/ip firewall filter find where action=fasttrack-connection && !disabled]]); :put ("DR|" . [:len [/ip route find where dst-address="0.0.0.0/0" && static]]); :put ("MR|" . [:len [/ip firewall mangle find where action=mark-routing && !(comment~"^LBW")]]); :put ("TB|" . [:len [/routing table find where !(name="main")]]); :put ("NT|" . [:len [/ip firewall nat find where action=masquerade && out-interface-list=""]]); :put ("HS|" . [:len [/ip hotspot find]]); :put ("PS|" . [:len [/interface pppoe-server server find]]); :put ("QS|" . [:len [/queue simple find]]); :put ("RB|" . [:len [/system scheduler find where comment~"ROLLBACK-LBW"]]); :put ("LB|" . [:len [/ip firewall mangle find where comment~"^LBW"]]); :put ("DS|" . [:len [/ip dhcp-server find where !disabled]]); :put ("FI|" . [:len [/ip firewall filter find where chain=input && !dynamic && !disabled]]); :put ("FF|" . [:len [/ip firewall filter find where chain=forward && !dynamic && !disabled]]); :do { :local dd 0; :foreach c in=[/ip dhcp-client find where !disabled] do={ :local v [:tostr [/ip dhcp-client get $c add-default-route]]; :if ($v != "no" && $v != "false") do={ :set dd ($dd + 1) } }; :put ("DD|" . $dd) } on-error={}; :foreach n in=[/ip dhcp-server network find] do={ :put ("DN|" . [/ip dhcp-server network get $n address]) }; :put ("LS|" . [:len [/system script find where name="lbw-status"]]); :foreach f in=[/file find where name~"lbw-perfil.conf"] do={ :put ("PN|" . [/file get $f name]) }' 2>/dev/null | tr -d '\r')
   [[ -z $raw ]] && return 1
   local l a b
-  AUDIT_DHCPNETS=" "
+  AUDIT_DHCPNETS=" "; AUDIT_LBWSCRIPT=0; AUDIT_PROFILE=""
   while IFS= read -r l; do
     IFS='|' read -r a b <<< "$l"
     case $a in
       DN) AUDIT_DHCPNETS+="$b ";;
+      LS) AUDIT_LBWSCRIPT=${b:-0};; PN) AUDIT_PROFILE=$b;;
       FT) AUDIT_FT=${b:-0};; DR) AUDIT_DEFROUTE=${b:-0};; MR) AUDIT_MANGLE=${b:-0};;
       TB) AUDIT_TABLES=${b:-0};; NT) AUDIT_NAT=${b:-0};; HS) AUDIT_HOTSPOT=${b:-0};;
       PS) AUDIT_PPPSRV=${b:-0};; QS) AUDIT_QUEUE=${b:-0};; RB) AUDIT_ROLLBACK=${b:-0};; LB) AUDIT_LBW=${b:-0};;
@@ -436,14 +589,156 @@ PROBE_POOL=(
  "76.76.2.0|94.140.14.14"
  "76.76.10.0|94.140.15.15"
 )
-MODE="lb"; NWAN=2; CLASSIFIER="both-addresses"; LANIFS=""; LANNETS=""
-DNS="1.1.1.1,8.8.8.8"; DNSREMOTE="s"; MSSCLAMP="s"; PROTECTWAN="s"
-ROLE="router"; DOWNGW=""; BALIP=""; CLIENTNETS=""; LINKMODE="auto"; LINKNET=""; UPIF="ether1"; LINKDHCP="si"
-TGENABLE="n"; TGTOKEN=""; TGCHAT=""; ROLLBACK_MIN=10; STARTMODE="keep"
-LANMODE="existing"; LANCREATE="n"; LANPORTS=""; LANGW=""; LANPOOL=""
-HARDEN="s"; MGMTNETS=""; PIN="n"; DISKLOG="s"; NTPSET="s"; TZNAME=""
+reset_state(){ # valores por defecto de todas las respuestas
+  WNAME=(); WIF=(); WIFBASE=(); WFINAL=(); WTYPE=(); WADDR=(); WGW=(); WUSER=(); WPASS=()
+  WVLAN=(); WSPEED=(); WROLE=(); WP1=(); WP2=(); WPIN=()
+  MODE="lb"; NWAN=2; CLASSIFIER="both-addresses"; LANIFS=""; LANNETS=""
+  DNS="1.1.1.1,8.8.8.8"; DNSREMOTE="s"; MSSCLAMP="s"; PROTECTWAN="s"
+  ROLE="router"; DOWNGW=""; BALIP=""; CLIENTNETS=""; LINKMODE="auto"; LINKNET=""; UPIF="ether1"; LINKDHCP="si"
+  TGENABLE="n"; TGTOKEN=""; TGCHAT=""; ROLLBACK_MIN=10; STARTMODE="keep"
+  LANMODE="existing"; LANCREATE="n"; LANPORTS=""; LANGW=""; LANPOOL=""
+  HARDEN="s"; MGMTNETS=""; PIN="n"; DISKLOG="s"; NTPSET="s"; TZNAME=""
+  PREFILL=0
+}
 declare -a WPIN
+reset_state
 OUTNAME="lbw-config.rsc"
+
+# ============================ Perfil =================================
+# Las respuestas se guardan en lbw-perfil.conf (en esta carpeta y en el
+# router) para precargarlas la proxima vez. Sin contraseñas ni tokens.
+# El archivo NO se ejecuta: se lee linea a linea y solo se aceptan claves
+# conocidas con valores validados, para que un perfil alterado en el router
+# no pueda ejecutar nada en esta PC.
+PROF_SCALARS="MODE NWAN CLASSIFIER ROLE LANMODE LANCREATE LANIFS LANNETS LANPORTS LANGW LANPOOL LINKMODE LINKNET BALIP DOWNGW CLIENTNETS UPIF LINKDHCP DNS DNSREMOTE MSSCLAMP PROTECTWAN HARDEN MGMTNETS PIN DISKLOG NTPSET TZNAME TGENABLE TGCHAT ROLLBACK_MIN"
+PROF_WANS="WNAME WIFBASE WTYPE WVLAN WADDR WGW WUSER WSPEED WPIN"
+BADCH='[]["\\$`;{}[]'
+declare -A PROF
+PROF_OK=0; PROF_SRC=""; PROF_BAD=0; PROF_REJECT=0
+is_name(){ [[ -n $1 ]] && ! [[ $1 =~ $BADCH ]]; }
+prof_ok(){ # clave valor -> 0 si el valor es aceptable para esa clave
+  local k=$1 v=$2
+  case $k in
+    MODE) [[ $v == lb || $v == fo ]];;
+    NWAN) [[ $v =~ ^[2-6]$ ]];;
+    CLASSIFIER) [[ $v =~ ^(src-address|both-addresses|both-addresses-and-ports)$ ]];;
+    ROLE) [[ $v == router || $v == balancer ]];;
+    LANMODE) [[ $v == create || $v == existing ]];;
+    LINKMODE) [[ $v == auto || $v == manual ]];;
+    LINKDHCP) [[ $v == si || $v == no ]];;
+    DNSREMOTE) [[ $v =~ ^(s|n|keep)$ ]];;
+    LANCREATE|MSSCLAMP|PROTECTWAN|HARDEN|PIN|DISKLOG|NTPSET|TGENABLE) [[ $v == s || $v == n ]];;
+    ROLLBACK_MIN|WSPEED_[1-6]) is_num "$v";;
+    WVLAN_[1-6]) [[ $v =~ ^[0-9]{1,4}$ ]] && (( v <= 4094 ));;
+    WTYPE_[1-6]) [[ $v =~ ^(dhcp|pppoe|static|ptp)$ ]];;
+    BALIP|DOWNGW|WGW_[1-6]) [[ -z $v ]] || is_ip "$v";;
+    LANGW|LINKNET|WADDR_[1-6]) [[ -z $v ]] || is_cidr "$v";;
+    LANPOOL) [[ -z $v ]] || is_range "$v";;
+    LANNETS|CLIENTNETS|MGMTNETS|DNS) [[ $v =~ ^[0-9./,]*$ ]];;
+    LANIFS|LANPORTS|UPIF|WIFBASE_[1-6]) [[ $v =~ ^[A-Za-z0-9_.,-]*$ ]];;
+    WPIN_[1-6]) [[ $v =~ ^[A-Za-z0-9_./,:-]*$ ]];;
+    TZNAME) [[ $v =~ ^[A-Za-z0-9_/+-]*$ ]];;
+    TGCHAT) [[ $v =~ ^-?[0-9]*$ ]];;
+    WNAME_[1-6]|WUSER_[1-6]|SAVED|IDENT|VERSION) ! [[ $v =~ $BADCH ]];;
+    *) return 1;;
+  esac
+}
+local_prof_name(){ local id=${IDENT:-manual}; id=${id//[^A-Za-z0-9_-]/_}; echo "lbw-perfil-$id.conf"; }
+save_profile(){ # archivo
+  local k i ref
+  {
+    echo "# LBW Wizard - perfil de configuracion (sin contraseñas ni tokens)"
+    echo "# $REPO_URL"
+    echo "VERSION=$VERSION"
+    echo "SAVED=$(date '+%Y-%m-%d %H:%M')"
+    echo "IDENT=$IDENT"
+    for k in $PROF_SCALARS; do echo "$k=${!k}"; done
+    for ((i=1; i<=NWAN; i++)); do
+      for k in $PROF_WANS; do ref="${k}[$i]"; echo "${k}_$i=${!ref}"; done
+    done
+  } > "$1"
+}
+load_profile(){ # archivo -> llena PROF; 0 si es un perfil completo y valido
+  local line k v i
+  PROF=(); PROF_BAD=0
+  [[ -r $1 ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ -z $line || $line == \#* ]] && continue
+    if [[ $line != *=* ]]; then ((PROF_BAD++)); continue; fi
+    k=${line%%=*}; v=${line#*=}
+    if [[ $k =~ ^[A-Z_]+[1-6]?$ ]] && prof_ok "$k" "$v"; then PROF[$k]=$v; else ((PROF_BAD++)); fi
+  done < "$1"
+  [[ -n ${PROF[MODE]:-} && -n ${PROF[NWAN]:-} ]] || return 1
+  local n=${PROF[NWAN]}
+  for ((i=1; i<=n; i++)); do
+    [[ -n ${PROF[WNAME_$i]:-} && -n ${PROF[WIFBASE_$i]:-} && -n ${PROF[WTYPE_$i]:-} ]] || return 1
+  done
+  return 0
+}
+derive_wans(){ # nombres finales, probes y papel de cada linea
+  local i p1 p2
+  for ((i=1; i<=NWAN; i++)); do
+    WIF[$i]=${WIFBASE[$i]}
+    IFS='|' read -r p1 p2 <<< "${PROBE_POOL[$((i-1))]}"
+    WP1[$i]=$p1; WP2[$i]=$p2
+    if [[ ${WTYPE[$i]} == pppoe ]]; then WFINAL[$i]="pppoe_ISP$i"
+    elif (( ${WVLAN[$i]:-0} > 0 )); then WFINAL[$i]="vlan${WVLAN[$i]}_ISP$i"
+    else WFINAL[$i]="${WIFBASE[$i]}_ISP$i"; fi
+    if [[ $MODE == lb ]] || (( i == 1 )); then WROLE[$i]="main"; else WROLE[$i]="backup"; fi
+    [[ $MODE == fo ]] && WSPEED[$i]=${WSPEED[$i]:-100}
+  done
+}
+apply_profile(){
+  local k i
+  reset_state
+  for k in $PROF_SCALARS; do [[ -n ${PROF[$k]+x} ]] && printf -v "$k" '%s' "${PROF[$k]}"; done
+  for ((i=1; i<=NWAN; i++)); do
+    for k in $PROF_WANS; do [[ -n ${PROF[${k}_$i]+x} ]] && printf -v "${k}[$i]" '%s' "${PROF[${k}_$i]}"; done
+    WPASS[$i]=""
+  done
+  derive_wans
+  (( DETECTED )) || IDENT=${PROF[IDENT]:-}
+  PREFILL=1
+}
+profile_missing(){ # puertos del perfil que no existen en el router conectado
+  (( DETECTED )) || return 0
+  local i b out="" x n=${PROF[NWAN]}
+  for ((i=1; i<=n; i++)); do
+    b=${PROF[WIFBASE_$i]}
+    (( $(ifidx "$b") >= 0 || $(ifidx "${b}_ISP$i") >= 0 )) || out+="$b "
+  done
+  if [[ ${PROF[LANCREATE]:-n} != s ]]; then
+    IFS=',' read -ra _pl <<< "${PROF[LANIFS]:-}"
+    for x in "${_pl[@]}"; do [[ -n $x ]] && (( $(ifidx "$x") < 0 )) && out+="$x "; done
+  fi
+  echo "${out% }"
+}
+rget_to(){ # archivo-del-router destino-local
+  if command -v sshpass >/dev/null 2>&1 && [[ -n ${SSHPASS:-} ]]; then
+    sshpass -e scp "${SSHOPT[@]}" "${SCP_O[@]}" -P "$RPORT" "$RUSER@$RHOST:$1" "$2"
+  else
+    scp "${SSHOPT[@]}" "${SCP_O[@]}" -P "$RPORT" "$RUSER@$RHOST:$1" "$2"
+  fi
+}
+fetch_profile(){ # perfil del router (o, si no hay, el de esta carpeta para ese router)
+  PROF_OK=0; PROF_SRC=""; PROF_REJECT=0
+  local tmp
+  if (( DETECTED )) && [[ -n ${AUDIT_PROFILE:-} ]]; then
+    tmp=$(mktemp -d /tmp/lbw-perfil-XXXXXX)
+    if rget_to "$AUDIT_PROFILE" "$tmp/lbw-perfil.conf" >/dev/null 2>&1 && load_profile "$tmp/lbw-perfil.conf"; then
+      PROF_OK=1; PROF_SRC="el router"
+    else PROF_REJECT=1
+    fi
+    rm -rf "$tmp"
+  fi
+  if (( !PROF_OK && DETECTED )) && [[ -f $(local_prof_name) ]] && load_profile "$(local_prof_name)"; then
+    PROF_OK=1; PROF_SRC="esta carpeta ($(local_prof_name))"
+  fi
+  return 0
+}
+lbw_installed(){ (( ${AUDIT_LBW:-0} > 0 || ${AUDIT_LBWSCRIPT:-0} > 0 )); }
+
 
 gcd(){ local a=$1 b=$2 t; while (( b )); do t=$b; b=$(( a % b )); a=$t; done; echo "$a"; }
 
@@ -567,61 +862,14 @@ do_reset(){ # resetea y vuelve a conectar, para que el asistente vea el router l
 
 step_router(){
   screen 1
-  local START
-  q menu START "¿Cómo quieres empezar?" 1 \
-    "ssh|Conectarme al router y detectar sus puertos|Recomendado: lee interfaces, IPs y versión por SSH. No cambia nada." \
-    "manual|Modo manual, sin conexión|Escribes tú los nombres de interfaz; útil para preparar un .rsc por adelantado" || return 10
-  [[ $START == manual ]] && { DETECTED=0; return 0; }
-
-  connect_loop; local rc=$?
-  (( rc == 10 )) && return 10
-  (( rc == 1 )) && { DETECTED=0; return 0; }
-  DETECTED=1
-
-  local major=${ROS_VER%%.*}
-  if [[ $major =~ ^[0-9]+$ ]] && (( major < 7 )); then
-    box "$CE" "RouterOS no compatible" "Este router tiene RouterOS $ROS_VER." "LBW Wizard necesita RouterOS v7 (System → Packages → Check for updates)."
-    exit 1
-  elif [[ ! $major =~ ^[0-9]+$ ]]; then
-    warn "No pude leer la versión de RouterOS (respondió: '${ROS_VER:-nada}')."
-    local vok; q confirm vok "¿Sigo de todos modos? (hace falta RouterOS v7)" s || return 10
-    [[ $vok != s ]] && exit 1
+  local rc
+  if (( ! DETECTED )); then
+    box "$CA" "Modo manual, sin conexión" \
+      "Escribes tú los nombres de las interfaces." \
+      "Al final puedes enviar el .rsc al router por SSH o subirlo tú por Winbox."
+    echo; pause; return 0
   fi
-
-  local nif=0 x
-  for x in "${IFLIST[@]}"; do is_wan_candidate "$x" && ((nif++)); done
-  box "$CO" "Router detectado" \
-    "Modelo:     $BOARD" \
-    "Nombre:     $IDENT" \
-    "RouterOS:   $ROS_VER" \
-    "Plataforma: $( ((IS_CHR)) && echo "CHR (virtual) · licencia ${LICLEVEL:-?}" || echo "RouterBOARD físico · ${ARCH:-?} · ${CPUN:-?} núcleo(s)")" \
-    "Interfaces: $nif utilizables como WAN" \
-    "Firewall:   $FWCOUNT reglas"
-  echo
-  if run "Revisando qué puede chocar con el balanceo…" audit_router; then
-    local alerts=()
-    (( AUDIT_ROLLBACK > 0 )) && alerts+=("⚠ Hay una red de seguridad (ROLLBACK-LBW) armada de un intento anterior: te borrará esta configuración si no la desarmas.")
-    (( AUDIT_LBW > 0 )) && alerts+=("⚠ Ya hay reglas LBW en el router. Se reemplazan al aplicar.")
-    if (( AUDIT_FT > 0 )); then
-      if (( IS_CHR )); then alerts+=("• FastTrack activo ($AUDIT_FT reglas): se desactiva, es incompatible con el balanceo. En CHR el costo de CPU es bajo.")
-      else alerts+=("• FastTrack activo ($AUDIT_FT reglas): se desactiva, es incompatible con el balanceo. En equipos ${ARCH:-ARM/MIPS} de pocos núcleos baja el máximo de Mbps: revisa la tabla 'Test results' de tu modelo en mikrotik.com."); fi
-    fi
-    (( IS_CHR )) && [[ ${LICLEVEL,,} == free ]] && alerts+=("• CHR con licencia free: cada interfaz queda limitada a 1 Mbps de subida. Sirve para probar el failover y el reparto, NO para medir velocidad (usa la prueba p1 de 60 días).")
-    (( AUDIT_DHCPDR > 0 )) && alerts+=("• $AUDIT_DHCPDR DHCP client(s) instalan su propia ruta por defecto. Los que no sean WAN de LBW pasan a distancia 200 (quedan de último recurso); el desinstalador les devuelve su valor.")
-    if (( AUDIT_FWIN == 0 || AUDIT_FWFWD == 0 )); then alerts+=("• Firewall incompleto (input: $AUDIT_FWIN reglas, forward: $AUDIT_FWFWD). Contesta Sí a 'Bloquear el acceso desde Internet' en Extras: pone las reglas básicas del defconf.")
-    fi
-    (( AUDIT_DHCPSRV == 0 )) && alerts+=("• No hay servidor DHCP activo: en modo todo en uno el asistente te ofrecerá crear la LAN (bridge, IP y DHCP).")
-    (( AUDIT_DEFROUTE > 0 )) && alerts+=("• $AUDIT_DEFROUTE ruta(s) por defecto estáticas: se apartan y el desinstalador las devuelve.")
-    (( AUDIT_MANGLE > 0 )) && alerts+=("• $AUDIT_MANGLE regla(s) mangle con mark-routing ajenas: pueden pelear con el balanceo. Revísalas a mano.")
-    (( AUDIT_TABLES > 0 )) && alerts+=("• $AUDIT_TABLES tabla(s) de ruteo ya creadas: si se llaman to_WANx habrá conflicto.")
-    (( AUDIT_NAT > 0 )) && alerts+=("• $AUDIT_NAT regla(s) masquerade sin lista de salida: se apartan y se pone una con out-interface-list.")
-    (( AUDIT_HOTSPOT > 0 )) && alerts+=("• Hotspot configurado: mete su propio NAT y marcado. No probado con LBW.")
-    (( AUDIT_PPPSRV > 0 )) && alerts+=("• Servidor PPPoE activo: revisa que sus clientes no entren al balanceo.")
-    (( AUDIT_QUEUE > 0 )) && alerts+=("• $AUDIT_QUEUE cola(s) simples: si están atadas a una interfaz, el renombrado las deja sin efecto.")
-    if (( ${#alerts[@]} )); then box "$CW" "Qué encontré en este router" "${alerts[@]}"
-    else box "$CO" "Qué encontré en este router" "Nada que choque con el balanceo. Router limpio."; fi
-    echo
-  fi
+  show_router
   if (( IS_CHR )); then
     # El CHR no tiene configuracion de fabrica (sin 192.168.88.1, sin bridge,
     # sin firewall): "resetear a fabrica" no aporta nada y deja la VM a ciegas.
@@ -681,7 +929,7 @@ step_wans(){
     local j; for ((j=1; j<i; j++)); do USED_IFS+="${WIFBASE[$j]} "; done
     screen 3
     say "${CA}${BOLD}Proveedor $i de $NWAN${N}   ${CD}(Esc o ← para volver)${N}"; echo
-    q input WNAME[$i] "Nombre de esta línea (como la llamas tú)" "${WNAME[$i]:-ISP$i}" is_any "Escribe algo." "Ej.: Claro, Altice, Starlink, LTE" || { (( i == 1 )) && return 10; ((i--)); continue; }
+    q input WNAME[$i] "Nombre de esta línea (como la llamas tú)" "${WNAME[$i]:-ISP$i}" is_name "Escribe un nombre sin comillas, \$, ; ni corchetes." "Ej.: Claro, Altice, Starlink, LTE" || { (( i == 1 )) && return 10; ((i--)); continue; }
     if (( DETECTED )); then
       opts=()
       for x in "${IFLIST[@]}"; do
@@ -690,6 +938,8 @@ step_wans(){
         opts+=("$x|$x|$(ifdesc "$x")")
       done
       opts+=("__other|Escribir otra interfaz|Por ejemplo una interfaz que aún no existe")
+      pick=""
+      for x in "${IFLIST[@]}"; do [[ -n ${WIFBASE[$i]} && ${x%_ISP[0-9]} == "${WIFBASE[$i]}" ]] && pick=$x; done
       q menu pick "¿En qué puerto está conectado ${WNAME[$i]}?" 1 "${opts[@]}" || { (( i == 1 )) && return 10; ((i--)); continue; }
       if [[ $pick == __other ]]; then
         q input WIFBASE[$i] "Nombre de la interfaz" "ether$i" is_any || { ((i--)); continue; }
@@ -701,6 +951,7 @@ step_wans(){
     WIFBASE[$i]=${WIFBASE[$i]%_ISP[0-9]}
     base=${WIFBASE[$i]}
 
+    t=${WTYPE[$i]}
     q menu t "¿Cómo recibe la IP esta línea?" 1 \
       "dhcp|Automática (DHCP)|Lo normal con un módem o router del ISP" \
       "pppoe|PPPoE con usuario y contraseña|Fibra o DSL conectada directo al MikroTik" \
@@ -708,6 +959,7 @@ step_wans(){
       "ptp|Interfaz que ya trae su salida (LTE, túnel, otro router)|El gateway es la propia interfaz" || { ((i--)); (( i < 1 )) && return 10; continue; }
     WTYPE[$i]=$t
 
+    v=$( (( ${WVLAN[$i]:-0} > 0 )) && echo si || echo no)
     q menu v "¿El ISP te entrega el servicio en una VLAN?" 2 "si|Sí|Hay que crear una interfaz VLAN sobre el puerto" "no|No|Lo más común" || continue
     if [[ $v == si ]]; then
       q input WVLAN[$i] "ID de VLAN" "${WVLAN[$i]:-100}" is_vlan "Entre 1 y 4094." || continue
@@ -719,8 +971,9 @@ step_wans(){
         q input WGW[$i] "Gateway del ISP" "${WGW[$i]}" is_ip "Escribe una IP válida." || continue
         ;;
       pppoe)
-        q input WUSER[$i] "Usuario PPPoE" "${WUSER[$i]}" is_any || continue
-        q secret WPASS[$i] "Contraseña PPPoE" || continue
+        q input WUSER[$i] "Usuario PPPoE" "${WUSER[$i]}" is_name "Sin comillas, \$, ; ni corchetes." || continue
+        if (( PREFILL )); then q secret WPASS[$i] "Contraseña PPPoE (vacía = conservar la que ya tiene el router)" || continue
+        else q secret WPASS[$i] "Contraseña PPPoE" || continue; fi
         ;;
     esac
 
@@ -802,6 +1055,7 @@ step_lan(){
       "Al final te genero un segundo archivo con lo que hay que aplicarle a ese router."
     echo
     if (( DETECTED )); then
+      lpick=$LANIFS
       q menu lpick "¿Por qué puerto se conecta el router de abajo?" 1 "${lopts[@]}" || return 10
       if [[ $lpick == __other ]]; then
         q input LANIFS "Interfaz del enlace hacia el router de abajo" "${LANIFS:-ether5}" is_any || return 10
@@ -925,6 +1179,7 @@ step_lan(){
     else
       LANCREATE="n"
       if (( DETECTED )); then
+        lpick=$LANIFS
         q menu lpick "¿Cuál es tu red local (LAN)?" 1 "${lopts[@]}" || return 10
         if [[ $lpick == __other ]]; then
           q input LANIFS "Interfaz o interfaces de la LAN (separadas por coma)" "${LANIFS:-bridge}" is_any || return 10
@@ -1048,19 +1303,263 @@ step_summary(){
   done
 }
 
-banner
-pause
-STEP=1
-while (( STEP <= 7 )); do
-  case $STEP in
-    1) step_router;; 2) step_mode;; 3) step_wans;; 4) step_split;;
-    5) step_lan;;    6) step_extras;; 7) step_summary;;
+# ========================== Pantallas y menu =========================
+screen0(){ # pantalla sin barra de pasos: "titulo"
+  ((TTY)) && printf '\e[2J\e[H'
+  echo
+  ctr "${CA}${BOLD}LBW Wizard${N} ${CD}— Multi-WAN MikroTik RouterOS v7 · v$VERSION${N}"
+  echo
+  [[ -n ${1:-} ]] && { ctr "${BOLD}${CT}$1${N}"; echo; }
+}
+
+check_ros_version(){
+  local major=${ROS_VER%%.*}
+  if [[ $major =~ ^[0-9]+$ ]] && (( major < 7 )); then
+    box "$CE" "RouterOS no compatible" "Este router tiene RouterOS $ROS_VER." "LBW Wizard necesita RouterOS v7 (System → Packages → Check for updates)."
+    exit 1
+  elif [[ ! $major =~ ^[0-9]+$ ]]; then
+    warn "No pude leer la versión de RouterOS (respondió: '${ROS_VER:-nada}')."
+    local vok; q confirm vok "¿Sigo de todos modos? (hace falta RouterOS v7)" s || return 10
+    [[ $vok != s ]] && exit 1
+  fi
+  return 0
+}
+
+connect_start(){ # conectarse al router (o modo manual) y leer todo una sola vez
+  local START rc
+  while true; do
+    q menu START "¿Cómo quieres empezar?" 1 \
+      "ssh|Conectarme al router  ★ recomendado|Lee el equipo, las interfaces y lo que puede chocar, y busca una configuración guardada. No cambia nada." \
+      "manual|Modo manual, sin conexión|Escribes tú los nombres de interfaz; útil para preparar un .rsc por adelantado" && break
+  done
+  if [[ $START == manual ]]; then DETECTED=0; PROF_OK=0; return 0; fi
+  connect_loop; rc=$?
+  (( rc == 10 || rc == 1 )) && { DETECTED=0; PROF_OK=0; return 0; }
+  DETECTED=1
+  check_ros_version || { DETECTED=0; return 0; }
+  run "Revisando qué puede chocar con el balanceo…" audit_router
+  run "Buscando una configuración guardada…" fetch_profile
+  return 0
+}
+
+show_router(){ # equipo + auditoria + estado de LBW
+  local nif=0 x
+  for x in "${IFLIST[@]}"; do is_wan_candidate "$x" && ((nif++)); done
+  box "$CO" "Router detectado" \
+    "Modelo:     $BOARD" \
+    "Nombre:     $IDENT" \
+    "RouterOS:   $ROS_VER" \
+    "Plataforma: $( ((IS_CHR)) && echo "CHR (virtual) · licencia ${LICLEVEL:-?}" || echo "RouterBOARD físico · ${ARCH:-?} · ${CPUN:-?} núcleo(s)")" \
+    "Interfaces: $nif utilizables como WAN" \
+    "Firewall:   $FWCOUNT reglas" \
+    "LBW:        $(lbw_installed && echo "instalado" || echo "no instalado")$( ((PROF_OK)) && echo " · configuración guardada del ${PROF[SAVED]:-?} (v${PROF[VERSION]:-?})")"
+  echo
+  local alerts=()
+  (( AUDIT_ROLLBACK > 0 )) && alerts+=("⚠ Hay una red de seguridad (ROLLBACK-LBW) armada de un intento anterior: te borrará esta configuración si no la desarmas.")
+  (( AUDIT_LBW > 0 )) && alerts+=("⚠ Ya hay reglas LBW en el router. Se reemplazan al aplicar.")
+  if (( AUDIT_FT > 0 )); then
+    if (( IS_CHR )); then alerts+=("• FastTrack activo ($AUDIT_FT reglas): se desactiva, es incompatible con el balanceo. En CHR el costo de CPU es bajo.")
+    else alerts+=("• FastTrack activo ($AUDIT_FT reglas): se desactiva, es incompatible con el balanceo. En equipos ${ARCH:-ARM/MIPS} de pocos núcleos baja el máximo de Mbps: revisa la tabla 'Test results' de tu modelo en mikrotik.com."); fi
+  fi
+  (( IS_CHR )) && [[ ${LICLEVEL,,} == free ]] && alerts+=("• CHR con licencia free: cada interfaz queda limitada a 1 Mbps de subida. Sirve para probar el failover y el reparto, NO para medir velocidad (usa la prueba p1 de 60 días).")
+  (( AUDIT_DHCPDR > 0 )) && alerts+=("• $AUDIT_DHCPDR DHCP client(s) instalan su propia ruta por defecto. Los que no sean WAN de LBW pasan a distancia 200 (quedan de último recurso); el desinstalador les devuelve su valor.")
+  if (( AUDIT_FWIN == 0 || AUDIT_FWFWD == 0 )); then alerts+=("• Firewall incompleto (input: $AUDIT_FWIN reglas, forward: $AUDIT_FWFWD). Contesta Sí a 'Bloquear el acceso desde Internet' en Extras: pone las reglas básicas del defconf.")
+  fi
+  (( AUDIT_DHCPSRV == 0 )) && alerts+=("• No hay servidor DHCP activo: en modo todo en uno el asistente te ofrecerá crear la LAN (bridge, IP y DHCP).")
+  (( AUDIT_DEFROUTE > 0 )) && alerts+=("• $AUDIT_DEFROUTE ruta(s) por defecto estáticas: se apartan y el desinstalador las devuelve.")
+  (( AUDIT_MANGLE > 0 )) && alerts+=("• $AUDIT_MANGLE regla(s) mangle con mark-routing ajenas: pueden pelear con el balanceo. Revísalas a mano.")
+  (( AUDIT_TABLES > 0 )) && alerts+=("• $AUDIT_TABLES tabla(s) de ruteo ya creadas: si se llaman to_WANx habrá conflicto.")
+  (( AUDIT_NAT > 0 )) && alerts+=("• $AUDIT_NAT regla(s) masquerade sin lista de salida: se apartan y se pone una con out-interface-list.")
+  (( AUDIT_HOTSPOT > 0 )) && alerts+=("• Hotspot configurado: mete su propio NAT y marcado. No probado con LBW.")
+  (( AUDIT_PPPSRV > 0 )) && alerts+=("• Servidor PPPoE activo: revisa que sus clientes no entren al balanceo.")
+  (( AUDIT_QUEUE > 0 )) && alerts+=("• $AUDIT_QUEUE cola(s) simples: si están atadas a una interfaz, el renombrado las deja sin efecto.")
+  if (( ${#alerts[@]} )); then box "$CW" "Qué encontré en este router" "${alerts[@]}"
+  else box "$CO" "Qué encontré en este router" "Nada que choque con el balanceo. Router limpio."; fi
+  echo
+}
+
+show_status(){
+  screen0 "Estado de LBW"
+  local out ev l
+  out=$(run "Consultando las líneas…" rssh '/system script run lbw-status' | tr -d '\r')
+  if [[ -z $out ]]; then err "El router no respondió a lbw-status. ¿Está instalado LBW y sigue habiendo conexión?"
+  else
+    local ls=(); while IFS= read -r l; do [[ -n $l ]] && ls+=("$l"); done <<< "$out"
+    box "$CA" "Líneas" "${ls[@]}"
+  fi
+  echo
+  ev=$(run "Leyendo los eventos…" rssh ':foreach i in=[/log find where message~"LBW"] do={ :put ([/log get $i time] . "  " . [/log get $i message]) }' | tr -d '\r' | tail -n 12)
+  if [[ -z $ev ]]; then box "$CB" "Últimos eventos LBW" "Ninguno en el log de memoria (se borra al reiniciar; el historial queda en el archivo lbw-log del router)."
+  else
+    local es=(); while IFS= read -r l; do [[ -n $l ]] && es+=("$l"); done <<< "$ev"
+    box "$CB" "Últimos eventos LBW" "${es[@]}"
+  fi
+  echo
+}
+
+do_uninstall(){
+  screen0 "Desinstalar LBW"
+  box "$CW" "Esto quita LBW del router" \
+    "Borra sus rutas, reglas, tablas, scripts y la configuración guardada en el router." \
+    "Devuelve lo que LBW apartó: rutas, NAT, FastTrack, servicios, nombres de interfaz y puertos de bridge." \
+    "Antes guarda un backup en el router: pre-lbw-remove.backup y pre-lbw-remove.rsc." \
+    "Usa un desinstalador recién generado por esta versión, no el que haya en el router." \
+    "Si LBW creó la LAN (bridge-lan) y entras por ella, perderás la conexión; el desinstalador termina igual." \
+    "La copia de la configuración en esta carpeta ($(local_prof_name)) se conserva."
+  echo
+  local c s
+  q confirm c "¿Desinstalar ahora?" n || return 0
+  [[ $c != s ]] && return 0
+  gen_remove > lbw-remove.rsc
+  if ! validate_rsc lbw-remove.rsc; then err "No subo un desinstalador que no pasa la validación."; return 0; fi
+  run "Guardando backup del router…" rssh '/system backup save name="pre-lbw-remove"; /export file="pre-lbw-remove"' >/dev/null && ok "Backup pre-lbw-remove guardado en el router."
+  if ! run "Subiendo el desinstalador…" rscp lbw-remove.rsc; then err "No pude subir lbw-remove.rsc. Súbelo por Winbox → Files y ejecuta: /import file-name=lbw-remove.rsc"; return 0; fi
+  # En segundo plano en el router: si la sesion SSH se corta a mitad, igual termina
+  run "Desinstalando…" rssh ':execute script="/import file-name=lbw-remove.rsc verbose=yes" file=lbw-remove-log' >/dev/null
+  if ((TTY)); then for s in $(seq 12 -1 1); do printf '\r%s%s⏳%s Esperando a que termine… %s%2ds%s' "$M" "$CA" "$N" "$BOLD" "$s" "$N"; sleep 1; done; printf '\r\e[2K'; else sleep 12; fi
+  if run "Comprobando…" detect_router && run "Comprobando…" audit_router; then
+    if lbw_installed; then
+      warn "Quedan restos de LBW. Mira qué falló en el router con:  /log print where message~\"LBW-remove|no pude restaurar\""
+    else
+      ok "LBW desinstalado. El router quedó como estaba antes de instalarlo."
+      PROF_OK=0
+    fi
+  else
+    warn "No pude volver a conectarme. Si entrabas por la LAN que creó LBW, conéctate por otro puerto y revisa con Winbox."
+    DETECTED=0
+  fi
+}
+
+check_local_rsc(){
+  screen0 "Validar un .rsc"
+  local files=() f pick opts=()
+  while IFS= read -r f; do [[ -n $f ]] && files+=("$f"); done < <(ls -t -- *.rsc 2>/dev/null | head -n 15)
+  if (( ${#files[@]} == 0 )); then warn "No hay archivos .rsc en esta carpeta ($(pwd))."; return 0; fi
+  for f in "${files[@]}"; do opts+=("$f|$f|$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null) · $(wc -l < "$f") líneas"); done
+  q menu pick "¿Cuál valido?" 1 "${opts[@]}" || return 0
+  validate_rsc "$pick"
+}
+
+profile_offer(){ # decide si el asistente arranca con una configuracion guardada
+  WIZ_START=1
+  local f files=() pick opts=() miss i wl="" c
+  if (( !PROF_OK && !DETECTED )); then
+    while IFS= read -r f; do [[ -n $f ]] && files+=("$f"); done < <(ls -t -- lbw-perfil-*.conf 2>/dev/null | head -n 10)
+    if (( ${#files[@]} )); then
+      screen0 "Configuraciones guardadas en esta carpeta"
+      for f in "${files[@]}"; do opts+=("$f|$f|$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null)"); done
+      opts+=("__none|Empezar de cero|")
+      q menu pick "¿Partimos de alguna?" 1 "${opts[@]}" || return 10
+      if [[ $pick != __none ]]; then
+        if load_profile "$pick"; then PROF_OK=1; PROF_SRC="esta carpeta ($pick)"
+        else warn "$pick no es un perfil válido; empiezo de cero."; fi
+      fi
+    fi
+  fi
+  if (( !PROF_OK )); then (( PREFILL )) || reset_state; return 0; fi
+  screen0 "Configuración guardada"
+  local n=${PROF[NWAN]}
+  for ((i=1; i<=n; i++)); do wl+="${wl:+, }${PROF[WNAME_$i]} (${PROF[WIFBASE_$i]}, ${PROF[WTYPE_$i]})"; done
+  box "$CA" "Encontré una configuración guardada en $PROF_SRC" \
+    "Guardada: ${PROF[SAVED]:-?} con LBW v${PROF[VERSION]:-?}" \
+    "Modo:     $([[ ${PROF[MODE]} == lb ]] && echo "balanceo + respaldo" || echo "solo respaldo") · $n líneas" \
+    "Líneas:   $wl" \
+    "Papel:    $([[ ${PROF[ROLE]:-router} == router ]] && echo "balanceador y router de la LAN" || echo "solo balanceador, delante de otro router")" \
+    "No guarda contraseñas PPPoE ni el token de Telegram."
+  (( PROF_BAD > 0 )) && warn "Ignoré $PROF_BAD línea(s) del perfil que no eran válidas."
+  miss=$(profile_missing)
+  [[ -n $miss ]] && warn "En este router no existen: $miss. Te los pregunto en el asistente."
+  echo
+  opts=("use|Usar esta configuración  ★ recomendado|Precarga todas tus respuestas: solo das Enter en lo que no cambia.")
+  [[ -z $miss ]] && opts+=("reapply|Reaplicarla tal cual|Va directo al resumen para revisarla y aplicarla. Desde ahí puedes volver atrás.")
+  opts+=("fresh|Empezar de cero|Ignora la configuración guardada (no la borra).")
+  q menu c "¿Cómo seguimos?" 1 "${opts[@]}" || return 10
+  case $c in
+    use) apply_profile;;
+    reapply)
+      apply_profile
+      for ((i=1; i<=NWAN; i++)); do
+        [[ ${WTYPE[$i]} == pppoe ]] || continue
+        q secret "WPASS[$i]" "Contraseña PPPoE de ${WNAME[$i]} (vacía = conservar la que ya tiene el router)" || return 10
+      done
+      if [[ $TGENABLE == s ]]; then
+        q input TGTOKEN "Token del bot de Telegram (no se guarda)" "" is_any "No puede ir vacío." "Lo obtienes de @BotFather" || return 10
+      fi
+      WIZ_START=7;;
+    fresh) reset_state;;
   esac
-  rc=$?
-  if (( rc == 10 )); then (( STEP > 1 )) && ((STEP--)); continue; fi
-  (( rc != 0 )) && exit $rc
-  ((STEP++))
-done
+  return 0
+}
+
+run_wizard(){
+  profile_offer || return 0
+  local STEP=$WIZ_START rc
+  while (( STEP <= 7 )); do
+    case $STEP in
+      1) step_router;; 2) step_mode;; 3) step_wans;; 4) step_split;;
+      5) step_lan;;    6) step_extras;; 7) step_summary;;
+    esac
+    rc=$?
+    if (( rc == 10 )); then
+      (( STEP == 1 )) && return 0   # Esc en el paso 1: vuelve al menu
+      ((STEP--)); continue
+    fi
+    (( rc != 0 )) && exit $rc
+    ((STEP++))
+  done
+  do_generate
+  if (( DETECTED )); then
+    run "Releyendo el router…" detect_router || DETECTED=0
+    (( DETECTED )) && run "Releyendo el router…" audit_router
+  fi
+  if load_profile "$(local_prof_name)"; then PROF_OK=1; PROF_SRC="esta carpeta ($(local_prof_name))"; fi
+  return 0
+}
+
+main_menu(){
+  local op opts
+  while true; do
+    screen0
+    if (( DETECTED )); then
+      say "${CO}●${N} ${BOLD}$IDENT${N} ${CD}· $BOARD · RouterOS $ROS_VER · $RUSER@$RHOST${N}"
+      say "  LBW: $(lbw_installed && echo "${CO}instalado${N}" || echo "${CD}no instalado${N}")$( ((PROF_OK)) && echo " ${CD}· configuración guardada del ${PROF[SAVED]:-?}${N}")"
+      (( AUDIT_ROLLBACK > 0 )) && warn "Hay una red de seguridad (ROLLBACK-LBW) armada en el router."
+      (( PROF_REJECT )) && warn "La configuración guardada en el router (${AUDIT_PROFILE}) está incompleta o alterada: la ignoro."
+    else
+      say "${CD}○ Sin conexión: modo manual${N}"
+    fi
+    echo
+    opts=()
+    if lbw_installed; then
+      opts+=("cfg|Reconfigurar balanceo y failover|LBW ya está instalado: lo que configures ahora lo reemplaza.")
+    else
+      opts+=("cfg|Configurar balanceo y failover|El asistente paso a paso: genera la configuración, la valida y la aplica con red de seguridad.")
+    fi
+    if (( DETECTED )); then
+      opts+=("audit|Revisar el router|Solo diagnóstico: el equipo, qué choca con el balanceo y si LBW está instalado. No cambia nada.")
+      lbw_installed && opts+=("status|Ver el estado de LBW|Cada línea: si está en línea, su gateway y sus conexiones, más los últimos eventos.")
+      lbw_installed && opts+=("remove|Desinstalar LBW|Con backup previo; devuelve el router a como estaba.")
+    fi
+    opts+=("check|Validar un .rsc de esta carpeta|Revisa la sintaxis y las referencias sin conectarse a nada.")
+    if (( DETECTED )); then opts+=("reread|Volver a leer el router|Por si cambiaste algo en Winbox mientras tanto.")
+    else opts+=("connect|Conectarme a un router|Detecta el equipo y busca una configuración guardada."); fi
+    opts+=("quit|Salir|")
+    q menu op "¿Qué quieres hacer?" 1 "${opts[@]}" || continue
+    case $op in
+      cfg) run_wizard;;
+      audit) screen0 "Revisión del router"; run "Revisando…" audit_router; show_router; pause;;
+      status) show_status; pause;;
+      remove) do_uninstall; pause;;
+      check) check_local_rsc; pause;;
+      reread)
+        if run "Releyendo el router…" detect_router; then run "Revisando…" audit_router; run "Buscando una configuración guardada…" fetch_profile
+        else err "No pude volver a conectarme."; DETECTED=0; pause; fi;;
+      connect) screen0 "Conectarse a un router"; connect_start;;
+      quit) echo; echo "${M}${CD}LBW Wizard v$VERSION · $AUTHOR · $REPO_URL${N}"; echo; exit 0;;
+    esac
+  done
+}
+
 
 # ======================= Generador del .rsc ==========================
 urlenc(){ local s=$1; s=${s//%/%25}; s=${s// /%20}; s=${s//:/%3A}; s=${s//&/%26}; printf '%s' "$s"; }
@@ -1333,7 +1832,7 @@ RSC
 :if ([:len [/interface pppoe-client find where name="$fin"]] = 0) do={
   /interface pppoe-client add name="$fin" interface="$parent" user="${WUSER[$i]}" password="${WPASS[$i]}" \\
     add-default-route=no use-peer-dns=no disabled=no comment="LBW:WAN$i:pppoe"
-} else={ /interface pppoe-client set [find where name="$fin"] interface="$parent" user="${WUSER[$i]}" password="${WPASS[$i]}" add-default-route=no use-peer-dns=no disabled=no comment="LBW:WAN$i:pppoe" }
+} else={ /interface pppoe-client set [find where name="$fin"] interface="$parent" user="${WUSER[$i]}"$([[ -n ${WPASS[$i]} ]] && echo " password=\"${WPASS[$i]}\"") add-default-route=no use-peer-dns=no disabled=no comment="LBW:WAN$i:pppoe" }
 RSC
     elif (( ${WVLAN[$i]:-0} == 0 )); then
       cat << RSC
@@ -1940,6 +2439,9 @@ RSCHEAD
 :do { /system logging remove [find where action="lbwdisk"] } on-error={}
 :do { /system logging action remove [find where name="lbwdisk"] } on-error={}
 
+# 6d. Configuracion guardada por el asistente (la copia de tu PC se conserva)
+:do { /file remove [find where name~"lbw-perfil.conf"] } on-error={}
+
 # 7. Variables globales del monitor
 :do { /system script environment remove [find where name~"^LBW"] } on-error={}
 
@@ -2188,6 +2690,8 @@ LBWCHECKER
   return 1
 }
 
+# ===================== Generar, validar y aplicar ======================
+do_generate(){
 OUTNAME="lbw-$(date '+%m%d-%H%M').rsc"
 gen_rsc > "$OUTNAME"
 gen_remove > lbw-remove.rsc
@@ -2199,6 +2703,9 @@ if ! validate_rsc "$OUTNAME" lbw-remove.rsc $([[ $ROLE == balancer ]] && echo lb
   err "No subo nada al router con esto así. Repórtalo en $REPO_URL/issues con el .rsc adjunto."
   exit 1
 fi
+PROF_LOCAL=$(local_prof_name)
+save_profile "$PROF_LOCAL" && ok "Configuración guardada en ${BOLD}$PROF_LOCAL${N} (sin contraseñas ni tokens)"
+PROFTMP=$(mktemp -d /tmp/lbw-perfil-XXXXXX); cp "$PROF_LOCAL" "$PROFTMP/lbw-perfil.conf"
 
 # ========================= Despliegue ================================
 if (( ! DETECTED )); then
@@ -2227,7 +2734,7 @@ if (( DETECTED )); then
 
   if [[ $DEPLOY != none ]]; then
     run "Guardando backup del router…" rssh '/system backup save name="pre-lbw"; /export file="pre-lbw"' >/dev/null && ok "Backup pre-lbw.backup y pre-lbw.rsc guardados en el router."
-    if ! run "Subiendo archivos al router…" rscp "$OUTNAME" lbw-remove.rsc; then
+    if ! run "Subiendo archivos al router…" rscp "$OUTNAME" lbw-remove.rsc "$PROFTMP/lbw-perfil.conf"; then
       err "No pude subir los archivos. Arrástralos en Winbox → Files."; DEPLOY=none
     else ok "Archivos subidos al router."; fi
   fi
@@ -2322,5 +2829,15 @@ if [[ $ROLE == balancer ]]; then
     "Si usas queue tree con packet-marks en prerouting, revisa que tus reglas" \
     "de marcado queden ANTES de las de LBW (las de mark-routing van con passthrough=no)."
 fi
-echo "${M}${CD}LBW Wizard v$VERSION · $AUTHOR · $REPO_URL${N}"
-echo
+rm -rf "$PROFTMP"
+pause
+}
+
+# ============================== Inicio ===============================
+reset_state
+banner
+check_reqs
+pause
+screen0
+connect_start
+main_menu

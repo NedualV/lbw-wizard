@@ -94,6 +94,7 @@ Todo lo que crea LBW lleva un comentario que empieza por `LBW`. Lo que **aparta*
 | Enlace del modo balanceador | IP, pool, DHCP y rutas de vuelta | `LBW:link`, `LBW:downstream` | los borra |
 | Servicios del router | apagados o limitados | address-list `LBW-restore` (`LBW:svc:`) | los devuelve como estaban |
 | Log en disco | acción `lbwdisk` | por nombre | la quita (los archivos `lbw-log` se conservan) |
+| Configuración guardada | archivo `lbw-perfil.conf` | por nombre | lo borra (la copia de tu PC se conserva) |
 | DNS del router | servidores elegidos | — | no se revierte |
 | NTP y zona horaria | activados | — | no se revierte (es inocuo) |
 
@@ -131,8 +132,25 @@ No sustituye una prueba en un router real, pero atrapa lo que el import rechazar
 ## Requisitos
 
 - MikroTik con **RouterOS v7**
-- Linux o macOS con bash 4+
-- Opcional: `sshpass` para no escribir la contraseña en cada conexión (`sudo dnf install sshpass`)
+- Linux o macOS con **bash 4+**
+- Necesarios: `ssh`, `scp`, `awk`, `sed`, `grep`, `tput`, `mktemp`
+- Recomendados: `python3` (valida el `.rsc` antes de subirlo) y `sshpass` (escribes la contraseña del router una sola vez)
+
+No hace falta instalarlos a mano: al arrancar, el asistente comprueba qué tienes. Si está todo, muestra una línea y sigue. Si falta algo, te dice para qué sirve, te muestra el comando exacto de tu sistema y te pregunta si lo instala. Nunca usa `sudo` (o `doas`) sin tu confirmación.
+
+| Gestor | Distribuciones |
+|---|---|
+| `dnf` | Fedora, RHEL, Rocky, Alma (8 en adelante) |
+| `yum` | CentOS/RHEL 7 (sshpass viene de EPEL) |
+| `rpm-ostree` | Fedora Silverblue, Kinoite y otras inmutables (hay que reiniciar) |
+| `apt` | Debian, Ubuntu, Mint, Pop!_OS, Kali |
+| `pacman` | Arch, Manjaro, EndeavourOS |
+| `zypper` | openSUSE, SLES |
+| `apk` | Alpine (instala `bash` antes: `apk add bash`) |
+| `xbps` | Void |
+| `brew` | macOS |
+
+En otras (Gentoo, NixOS…) te dice qué falta para que lo instales tú. Si tu `scp` es anterior a OpenSSH 9 y no conoce la opción `-O`, el asistente lo detecta y la quita.
 
 ## Uso
 
@@ -143,6 +161,31 @@ chmod +x lbw-wizard.sh && ./lbw-wizard.sh
 ```
 
 En cualquier pregunta puedes pulsar **Esc** o **←** para volver a la anterior y corregir.
+
+### Qué pasa al arrancar
+
+1. Comprueba los requisitos (ver arriba).
+2. Se conecta al router **una sola vez**: detecta el equipo y las interfaces, revisa qué choca con el balanceo y busca una configuración guardada. También puedes trabajar en modo manual, sin conexión.
+3. Te muestra el menú **¿Qué quieres hacer?**:
+
+| Opción | Qué hace |
+|---|---|
+| Configurar / Reconfigurar balanceo y failover | El asistente de 7 pasos. Si LBW ya está instalado, lo reemplaza. |
+| Revisar el router | Solo diagnóstico: equipo, qué choca con el balanceo, si LBW está instalado y si hay un rollback pendiente. No cambia nada. |
+| Ver el estado de LBW | Ejecuta `lbw-status` y muestra los últimos eventos LBW. |
+| Desinstalar LBW | Backup previo y un desinstalador recién generado por esta versión (no el que haya en el router). |
+| Validar un `.rsc` de esta carpeta | Sin conexión. |
+| Volver a leer el router | Por si cambiaste algo en Winbox mientras tanto. |
+
+### Configuración guardada
+
+Al generar, el asistente guarda tus respuestas en `lbw-perfil-<nombre del router>.conf` en tu carpeta, y en el router como `lbw-perfil.conf`. La próxima vez que te conectes a ese router te ofrece:
+
+- **Usar esta configuración:** precarga todas las respuestas; solo das Enter en lo que no cambia.
+- **Reaplicarla tal cual:** va directo al resumen para revisarla y aplicarla.
+- **Empezar de cero.**
+
+No guarda contraseñas PPPoE ni el token de Telegram. Al reconfigurar, si dejas vacía la contraseña PPPoE, se conserva la que ya tiene el router. El archivo no se ejecuta: se lee línea a línea y solo se aceptan claves conocidas con valores válidos, así que un perfil alterado en el router no puede ejecutar nada en tu PC. En modo manual, el asistente te ofrece los perfiles de tu carpeta.
 
 Luego, si no lo aplicaste desde el asistente, en el router (Winbox → New Terminal, con Safe Mode, Ctrl+X):
 
@@ -201,7 +244,7 @@ Para simular la caída de una línea:
 | CHR en EVE-NG (2 ISP simulados) | 7.17 | todo en uno, LAN creada | failover por caída de enlace y recuperación, sin cortes en un ping continuo; lease perdido y recuperado; reinicio |
 | hEX RB750Gr3 | 7.24.5 | solo balanceador, 3 ISP | import completo sobre la configuración de fábrica |
 
-Las funciones nuevas de la v3.1 (red de enlace libre, servicios, fijados, log en disco, NTP, `lbw-status` y el desinstalador del router de abajo) pasan el validador en todos los montajes, pero aún están pendientes de prueba en equipo real.
+En RouterOS 7.24 se probaron en equipo real el endurecimiento de servicios, el log en disco y la instalación y desinstalación completas (v3.1.2). El menú inicial, la comprobación de requisitos y la configuración guardada (v3.2) pasan las pruebas con un router simulado y están pendientes de prueba en equipo real.
 
 ## Avisos y limitaciones
 
