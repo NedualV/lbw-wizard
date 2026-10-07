@@ -20,7 +20,7 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
   *) if locale -a 2>/dev/null | grep -qi '^C\.utf8$'; then export LC_ALL=C.UTF-8
      elif locale -a 2>/dev/null | grep -qi '^en_US\.utf8$'; then export LC_ALL=en_US.UTF-8; fi;;
 esac
-VERSION="3.1.1"
+VERSION="3.1.2"
 AUTHOR="Nedual Vargas (@NEDUALV)"
 AUTHOR_ASCII="Nedual Vargas (@NEDUALV)"
 REPO_URL="https://github.com/NedualV/lbw-wizard"
@@ -1079,7 +1079,7 @@ build_monitor(){
     cat << MON
   :foreach a in=[/ip address find where interface="${WFINAL[$i]}" && !disabled] do={
     :local ad [/ip address get \$a address]
-    :local pf [:pick \$ad ([:find \$ad "/"] + 1) [:len \$ad]]
+    :local pf [:tostr [:pick \$ad ([:find \$ad "/"] + 1) [:len \$ad]]]
     :local nw [:tostr [/ip address get \$a network]]
     :if (\$pf != "32") do={ :set nw (\$nw . "/" . \$pf) }
     :if ([:len [/ip firewall address-list find where list="LBW-local" && address=\$nw]] = 0) do={
@@ -1651,7 +1651,7 @@ $(build_status)
     :log error "LBW: no se creo el NAT. Reactivando el NAT anterior para no dejar la red sin salida."
     :foreach r in=[/ip firewall nat find where comment~"^PRE-LBW:"] do={
       :local c [/ip firewall nat get \$r comment]
-      /ip firewall nat set \$r disabled=no comment=[:pick \$c 8 [:len \$c]]
+      :do { /ip firewall nat set \$r disabled=no comment=[:tostr [:pick \$c 8 [:len \$c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
     }
   }
 } on-error={ :log error "LBW fallo: resumen" }
@@ -1766,33 +1766,33 @@ gen_router2_remove(){
 :do { /ip address remove [find where comment="LBW:uplink"] } on-error={}
 :foreach c in=[/ip dhcp-client find where comment~"^LBW:uplink-prev:"] do={
   :local cm [/ip dhcp-client get $c comment]
-  /ip dhcp-client set $c comment=[:pick $cm 16 [:len $cm]]
+  :do { /ip dhcp-client set $c comment=[:tostr [:pick $cm 16 [:len $cm]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 
 # 2. Devolver las otras salidas que se apartaron
 :foreach c in=[/ip dhcp-client find where comment~"^PRE-LBW-ADR:"] do={
   :local cm [/ip dhcp-client get $c comment]
-  /ip dhcp-client set $c add-default-route=yes comment=[:pick $cm 12 [:len $cm]]
+  :do { /ip dhcp-client set $c add-default-route=yes comment=[:tostr [:pick $cm 12 [:len $cm]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :do {
   :foreach c in=[/interface pppoe-client find where comment~"^PRE-LBW-ADR:"] do={
     :local cm [/interface pppoe-client get $c comment]
-    /interface pppoe-client set $c add-default-route=yes comment=[:pick $cm 12 [:len $cm]]
+    :do { /interface pppoe-client set $c add-default-route=yes comment=[:tostr [:pick $cm 12 [:len $cm]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
   }
 } on-error={}
 :foreach r in=[/ip route find where comment~"^PRE-LBW:"] do={
   :local c [/ip route get $r comment]
-  /ip route set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip route set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 
 # 3. NAT y FastTrack de vuelta
 :foreach r in=[/ip firewall nat find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall nat get $r comment]
-  /ip firewall nat set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall nat set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :foreach r in=[/ip firewall filter find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall filter get $r comment]
-  /ip firewall filter set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall filter set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 
 :log warning "LBW: router de abajo revertido"
@@ -1840,8 +1840,8 @@ RSCHEAD
 :foreach c in=[/ip dhcp-client find where comment~"^PRE-LBW-DIST:"] do={
   :local cm [/ip dhcp-client get $c comment]
   :local p [:find $cm ":" 13]
-  :local d [:pick $cm 13 $p]
-  :local rest [:pick $cm ($p + 1) [:len $cm]]
+  :local d [:tostr [:pick $cm 13 $p]]
+  :local rest [:tostr [:pick $cm ($p + 1) [:len $cm]]]
   :do { /ip dhcp-client set $c default-route-distance=[:tonum $d] comment=$rest } on-error={ /ip dhcp-client set $c comment=$rest }
 }
 
@@ -1867,7 +1867,7 @@ RSCHEAD
 :foreach f in=[/interface find where comment~"^LBW:WAN.*:was="] do={
   :local c [/interface get $f comment]
   :local p ([:find $c "was="] + 4)
-  :local orig [:pick $c $p [:len $c]]
+  :local orig [:tostr [:pick $c $p [:len $c]]]
   :if ([:len [/interface find where name=$orig]] = 0) do={
     /interface set $f name=$orig comment=""
   } else={ /interface set $f comment="" }
@@ -1881,7 +1881,7 @@ RSCHEAD
   :local p1 ([:find $c "br="] + 3)
   :local p2 [:find $c ":if="]
   :local br [:pick $c $p1 $p2]
-  :local ifn [:pick $c ($p2 + 4) [:len $c]]
+  :local ifn [:tostr [:pick $c ($p2 + 4) [:len $c]]]
   :if ([:len [/interface bridge port find where interface=$ifn]] = 0) do={
     :do { /interface bridge port add bridge=$br interface=$ifn; :log warning ("LBW: " . $ifn . " devuelto al bridge " . $br) } on-error={}
   }
@@ -1891,19 +1891,19 @@ RSCHEAD
 # 6. Reactivar lo que se aparto (PRE-LBW:comentario original)
 :foreach r in=[/ip route find where comment~"^PRE-LBW:"] do={
   :local c [/ip route get $r comment]
-  /ip route set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip route set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :foreach r in=[/ip firewall filter find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall filter get $r comment]
-  /ip firewall filter set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall filter set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :foreach r in=[/ip firewall nat find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall nat get $r comment]
-  /ip firewall nat set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall nat set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :foreach r in=[/ip firewall mangle find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall mangle get $r comment]
-  /ip firewall mangle set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall mangle set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 
 # 6b. Servicios del router como estaban antes de LBW
@@ -1912,10 +1912,10 @@ RSCHEAD
 #     winbox...), y esas no se pueden editar.
 :foreach a in=[/ip firewall address-list find where comment~"^LBW:svc:"] do={
   :local c [/ip firewall address-list get $a comment]
-  :local r [:pick $c 8 [:len $c]]
+  :local r [:tostr [:pick $c 8 [:len $c]]]
   :local p [:find $r ":"]
   :local nm [:pick $r 0 $p]
-  :local v [:pick $r ($p + 1) [:len $r]]
+  :local v [:tostr [:pick $r ($p + 1) [:len $r]]]
   :if ($nm = "btest") do={ :do { /tool bandwidth-server set enabled=yes } on-error={} }
   :if ($nm = "smb") do={ :do { /ip smb set enabled=$v } on-error={} }
   :if ($nm != "btest" && $nm != "smb") do={
@@ -1925,7 +1925,7 @@ RSCHEAD
       :if ($dyn != "true" && [/ip service get $s name] = $nm) do={
         :if ($v = "off") do={ :do { /ip service set $s disabled=no } on-error={} }
         :if ([:pick $v 0 3] = "af=") do={
-          :local af [:pick $v 3 [:len $v]]
+          :local af [:tostr [:pick $v 3 [:len $v]]]
           :do { /ip service set $s available-from=$af } on-error={
             :do { :local f [:parse "/ip service set \$sid address=\$val"]; $f sid=$s val=$af } on-error={}
           }
@@ -2129,6 +2129,22 @@ def scan(path):
         for m in re.finditer(r'/system logging action add\b[^\n]*?\bname=("?)([^"\s\]]+)', raw):
             if not re.fullmatch(r'[A-Za-z0-9]+', m.group(2)):
                 errs.append((n, 1, f"accion de logging '{m.group(2)}': RouterOS solo admite letras y numeros en el nombre"))
+    # :pick hasta el final del texto devuelve nil (no "") si el tramo queda
+    # vacio, y "set ...=nil" falla con invalid value: siempre con :tostr
+    for n, code in code_lines:
+        for m in re.finditer(r'\[:pick (\\?\$\w+) ', code):
+            ini = m.start()
+            prof, j = 0, ini
+            while j < len(code):
+                if code[j] == '[': prof += 1
+                elif code[j] == ']':
+                    prof -= 1
+                    if prof == 0: break
+                j += 1
+            trozo = code[ini:j + 1]
+            var = re.escape(m.group(1))
+            if re.search(r'\[:len ' + var + r'\]\]$', trozo) and not code[:ini].endswith('[:tostr '):
+                errs.append((n, 1, "[:pick ... [:len ...]] sin [:tostr ...]: si el resto queda vacio devuelve nil y el set falla (invalid value)"))
     # PCC: todos los restos cubiertos una sola vez
     buckets = {}
     for n, code in code_lines:

@@ -301,7 +301,7 @@
 :if ([/system resource get uptime] >= 60s) do={
   :foreach a in=[/ip address find where interface="ether1_ISP1" && !disabled] do={
     :local ad [/ip address get $a address]
-    :local pf [:pick $ad ([:find $ad "/"] + 1) [:len $ad]]
+    :local pf [:tostr [:pick $ad ([:find $ad "/"] + 1) [:len $ad]]]
     :local nw [:tostr [/ip address get $a network]]
     :if ($pf != "32") do={ :set nw ($nw . "/" . $pf) }
     :if ([:len [/ip firewall address-list find where list="LBW-local" && address=$nw]] = 0) do={
@@ -310,7 +310,7 @@
   }
   :foreach a in=[/ip address find where interface="ether2_ISP2" && !disabled] do={
     :local ad [/ip address get $a address]
-    :local pf [:pick $ad ([:find $ad "/"] + 1) [:len $ad]]
+    :local pf [:tostr [:pick $ad ([:find $ad "/"] + 1) [:len $ad]]]
     :local nw [:tostr [/ip address get $a network]]
     :if ($pf != "32") do={ :set nw ($nw . "/" . $pf) }
     :if ([:len [/ip firewall address-list find where list="LBW-local" && address=$nw]] = 0) do={
@@ -423,7 +423,7 @@
     :log error "LBW: no se creo el NAT. Reactivando el NAT anterior para no dejar la red sin salida."
     :foreach r in=[/ip firewall nat find where comment~"^PRE-LBW:"] do={
       :local c [/ip firewall nat get $r comment]
-      /ip firewall nat set $r disabled=no comment=[:pick $c 8 [:len $c]]
+      :do { /ip firewall nat set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
     }
   }
 } on-error={ :log error "LBW fallo: resumen" }

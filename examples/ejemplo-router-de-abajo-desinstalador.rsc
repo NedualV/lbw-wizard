@@ -9,33 +9,33 @@
 :do { /ip address remove [find where comment="LBW:uplink"] } on-error={}
 :foreach c in=[/ip dhcp-client find where comment~"^LBW:uplink-prev:"] do={
   :local cm [/ip dhcp-client get $c comment]
-  /ip dhcp-client set $c comment=[:pick $cm 16 [:len $cm]]
+  :do { /ip dhcp-client set $c comment=[:tostr [:pick $cm 16 [:len $cm]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 
 # 2. Devolver las otras salidas que se apartaron
 :foreach c in=[/ip dhcp-client find where comment~"^PRE-LBW-ADR:"] do={
   :local cm [/ip dhcp-client get $c comment]
-  /ip dhcp-client set $c add-default-route=yes comment=[:pick $cm 12 [:len $cm]]
+  :do { /ip dhcp-client set $c add-default-route=yes comment=[:tostr [:pick $cm 12 [:len $cm]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :do {
   :foreach c in=[/interface pppoe-client find where comment~"^PRE-LBW-ADR:"] do={
     :local cm [/interface pppoe-client get $c comment]
-    /interface pppoe-client set $c add-default-route=yes comment=[:pick $cm 12 [:len $cm]]
+    :do { /interface pppoe-client set $c add-default-route=yes comment=[:tostr [:pick $cm 12 [:len $cm]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
   }
 } on-error={}
 :foreach r in=[/ip route find where comment~"^PRE-LBW:"] do={
   :local c [/ip route get $r comment]
-  /ip route set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip route set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 
 # 3. NAT y FastTrack de vuelta
 :foreach r in=[/ip firewall nat find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall nat get $r comment]
-  /ip firewall nat set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall nat set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :foreach r in=[/ip firewall filter find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall filter get $r comment]
-  /ip firewall filter set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall filter set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 
 :log warning "LBW: router de abajo revertido"

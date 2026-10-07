@@ -34,8 +34,8 @@
 :foreach c in=[/ip dhcp-client find where comment~"^PRE-LBW-DIST:"] do={
   :local cm [/ip dhcp-client get $c comment]
   :local p [:find $cm ":" 13]
-  :local d [:pick $cm 13 $p]
-  :local rest [:pick $cm ($p + 1) [:len $cm]]
+  :local d [:tostr [:pick $cm 13 $p]]
+  :local rest [:tostr [:pick $cm ($p + 1) [:len $cm]]]
   :do { /ip dhcp-client set $c default-route-distance=[:tonum $d] comment=$rest } on-error={ /ip dhcp-client set $c comment=$rest }
 }
 
@@ -61,7 +61,7 @@
 :foreach f in=[/interface find where comment~"^LBW:WAN.*:was="] do={
   :local c [/interface get $f comment]
   :local p ([:find $c "was="] + 4)
-  :local orig [:pick $c $p [:len $c]]
+  :local orig [:tostr [:pick $c $p [:len $c]]]
   :if ([:len [/interface find where name=$orig]] = 0) do={
     /interface set $f name=$orig comment=""
   } else={ /interface set $f comment="" }
@@ -75,7 +75,7 @@
   :local p1 ([:find $c "br="] + 3)
   :local p2 [:find $c ":if="]
   :local br [:pick $c $p1 $p2]
-  :local ifn [:pick $c ($p2 + 4) [:len $c]]
+  :local ifn [:tostr [:pick $c ($p2 + 4) [:len $c]]]
   :if ([:len [/interface bridge port find where interface=$ifn]] = 0) do={
     :do { /interface bridge port add bridge=$br interface=$ifn; :log warning ("LBW: " . $ifn . " devuelto al bridge " . $br) } on-error={}
   }
@@ -85,19 +85,19 @@
 # 6. Reactivar lo que se aparto (PRE-LBW:comentario original)
 :foreach r in=[/ip route find where comment~"^PRE-LBW:"] do={
   :local c [/ip route get $r comment]
-  /ip route set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip route set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :foreach r in=[/ip firewall filter find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall filter get $r comment]
-  /ip firewall filter set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall filter set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :foreach r in=[/ip firewall nat find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall nat get $r comment]
-  /ip firewall nat set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall nat set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 :foreach r in=[/ip firewall mangle find where comment~"^PRE-LBW:"] do={
   :local c [/ip firewall mangle get $r comment]
-  /ip firewall mangle set $r disabled=no comment=[:pick $c 8 [:len $c]]
+  :do { /ip firewall mangle set $r disabled=no comment=[:tostr [:pick $c 8 [:len $c]]] } on-error={ :log error "LBW: no pude restaurar una entrada PRE-LBW" }
 }
 
 # 6b. Servicios del router como estaban antes de LBW
@@ -106,10 +106,10 @@
 #     winbox...), y esas no se pueden editar.
 :foreach a in=[/ip firewall address-list find where comment~"^LBW:svc:"] do={
   :local c [/ip firewall address-list get $a comment]
-  :local r [:pick $c 8 [:len $c]]
+  :local r [:tostr [:pick $c 8 [:len $c]]]
   :local p [:find $r ":"]
   :local nm [:pick $r 0 $p]
-  :local v [:pick $r ($p + 1) [:len $r]]
+  :local v [:tostr [:pick $r ($p + 1) [:len $r]]]
   :if ($nm = "btest") do={ :do { /tool bandwidth-server set enabled=yes } on-error={} }
   :if ($nm = "smb") do={ :do { /ip smb set enabled=$v } on-error={} }
   :if ($nm != "btest" && $nm != "smb") do={
@@ -119,7 +119,7 @@
       :if ($dyn != "true" && [/ip service get $s name] = $nm) do={
         :if ($v = "off") do={ :do { /ip service set $s disabled=no } on-error={} }
         :if ([:pick $v 0 3] = "af=") do={
-          :local af [:pick $v 3 [:len $v]]
+          :local af [:tostr [:pick $v 3 [:len $v]]]
           :do { /ip service set $s available-from=$af } on-error={
             :do { :local f [:parse "/ip service set \$sid address=\$val"]; $f sid=$s val=$af } on-error={}
           }
