@@ -20,7 +20,7 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
   *) if locale -a 2>/dev/null | grep -qi '^C\.utf8$'; then export LC_ALL=C.UTF-8
      elif locale -a 2>/dev/null | grep -qi '^en_US\.utf8$'; then export LC_ALL=en_US.UTF-8; fi;;
 esac
-VERSION="3.1"
+VERSION="3.1.1"
 AUTHOR="Nedual Vargas (@NEDUALV)"
 AUTHOR_ASCII="Nedual Vargas (@NEDUALV)"
 REPO_URL="https://github.com/NedualV/lbw-wizard"
@@ -1157,25 +1157,43 @@ gen_harden(){
   cat << RSC
 
 # --- 8c. Servicios del router (solo SSH y Winbox, desde $nets) -------
+# Solo entradas estaticas: desde RouterOS 7.19 /ip service lista tambien las
+# conexiones abiertas como entradas dinamicas (incluida esta sesion SSH), y esas
+# no se pueden editar. En 7.24 "address" paso a llamarse "available-from";
+# "address" queda de respaldo para v7 anteriores, dentro de :parse para que
+# 7.24+ no avise de sintaxis vieja. Cada servicio va protegido por separado.
 :do {
   :local n 0
   :foreach s in=[/ip service find] do={
+    :local dyn ""
+    :do { :set dyn [:tostr [/ip service get \$s dynamic]] } on-error={}
     :local nm [/ip service get \$s name]
-    :if ((\$nm = "telnet" || \$nm = "ftp" || \$nm = "www" || \$nm = "api" || \$nm = "api-ssl" || \$nm = "reverse-proxy") && ![/ip service get \$s disabled]) do={
-      :set n (\$n + 1)
-      :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . \$n) comment=("LBW:svc:" . \$nm . ":off") } on-error={}
-      /ip service set \$s disabled=yes
-    }
-    :if (\$nm = "ssh" || \$nm = "winbox") do={
-      :local af ""
-      :do {
-        :foreach x in=[/ip service get \$s available-from] do={ :if ([:len \$af] > 0) do={ :set af (\$af . ",") }; :set af (\$af . \$x) }
-      } on-error={
-        :do { :foreach x in=[/ip service get \$s address] do={ :if ([:len \$af] > 0) do={ :set af (\$af . ",") }; :set af (\$af . \$x) } } on-error={}
+    :if (\$dyn != "true") do={
+      :if (\$nm = "telnet" || \$nm = "ftp" || \$nm = "www" || \$nm = "api" || \$nm = "api-ssl" || \$nm = "reverse-proxy") do={
+        :do {
+          :if (![/ip service get \$s disabled]) do={
+            :set n (\$n + 1)
+            :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . \$n) comment=("LBW:svc:" . \$nm . ":off") } on-error={}
+            /ip service set \$s disabled=yes
+          }
+        } on-error={ :log error ("LBW fallo: apagar servicio " . \$nm) }
       }
-      :set n (\$n + 1)
-      :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . \$n) comment=("LBW:svc:" . \$nm . ":af=" . \$af) } on-error={}
-      :do { /ip service set \$s available-from=$nets } on-error={ /ip service set \$s address=$nets }
+      :if (\$nm = "ssh" || \$nm = "winbox") do={
+        :do {
+          :local cur ""
+          :do { :set cur [/ip service get \$s available-from] } on-error={
+            :do { :local g [:parse ":return [/ip service get \\\$sid address]"]; :set cur [\$g sid=\$s] } on-error={}
+          }
+          :local af ""
+          :foreach x in=\$cur do={ :if ([:len \$af] > 0) do={ :set af (\$af . ",") }; :set af (\$af . \$x) }
+          :set n (\$n + 1)
+          :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . \$n) comment=("LBW:svc:" . \$nm . ":af=" . \$af) } on-error={}
+          :do { /ip service set \$s available-from=$nets } on-error={
+            :local f [:parse "/ip service set \\\$sid address=$nets"]
+            \$f sid=\$s
+          }
+        } on-error={ :log error ("LBW fallo: limitar servicio " . \$nm) }
+      }
     }
   }
   :do {
@@ -1183,14 +1201,14 @@ gen_harden(){
       :do { /ip firewall address-list add list=LBW-restore address=127.0.2.200 comment="LBW:svc:btest:on" } on-error={}
       /tool bandwidth-server set enabled=no
     }
-  } on-error={}
+  } on-error={ :log error "LBW fallo: apagar bandwidth-server" }
   :do {
     :local sm [:tostr [/ip smb get enabled]]
     :if (\$sm != "no" && \$sm != "false") do={
       :do { /ip firewall address-list add list=LBW-restore address=127.0.2.201 comment=("LBW:svc:smb:" . \$sm) } on-error={}
       /ip smb set enabled=no
     }
-  } on-error={}
+  } on-error={ :log error "LBW fallo: apagar SMB" }
   :log warning "LBW: servicios del router endurecidos (solo SSH y Winbox desde $nets)"
 } on-error={ :log error "LBW fallo: endurecer servicios" }
 RSC
@@ -1202,13 +1220,13 @@ gen_disklog_ntp(){
 
 # --- 8d. Log de LBW en disco (sobrevive a los reinicios) -------------
 :do {
-  :if ([:len [/system logging action find where name="lbw-disk"]] = 0) do={
+  :if ([:len [/system logging action find where name="lbwdisk"]] = 0) do={
     :local f "lbw-log"
     :do { :local d [/system logging action get [find where name="disk"] disk-file-name]; :if ([:pick $d 0 6] = "flash/") do={ :set f "flash/lbw-log" } } on-error={}
-    /system logging action add name=lbw-disk target=disk disk-file-name=$f disk-lines-per-file=2000 disk-file-count=2
+    /system logging action add name=lbwdisk target=disk disk-file-name=$f disk-lines-per-file=2000 disk-file-count=2
   }
-  :if ([:len [/system logging find where action="lbw-disk"]] = 0) do={
-    :do { /system logging add topics=script action=lbw-disk regex="LBW" } on-error={ /system logging add topics=script action=lbw-disk }
+  :if ([:len [/system logging find where action="lbwdisk"]] = 0) do={
+    :do { /system logging add topics=script action=lbwdisk regex="LBW" } on-error={ /system logging add topics=script action=lbwdisk }
   }
 } on-error={ :log error "LBW fallo: log en disco" }
 RSC
@@ -1889,6 +1907,9 @@ RSCHEAD
 }
 
 # 6b. Servicios del router como estaban antes de LBW
+#     Solo entradas estaticas: desde RouterOS 7.19 /ip service lista tambien las
+#     conexiones abiertas como entradas dinamicas con el mismo nombre (ssh,
+#     winbox...), y esas no se pueden editar.
 :foreach a in=[/ip firewall address-list find where comment~"^LBW:svc:"] do={
   :local c [/ip firewall address-list get $a comment]
   :local r [:pick $c 8 [:len $c]]
@@ -1897,17 +1918,27 @@ RSCHEAD
   :local v [:pick $r ($p + 1) [:len $r]]
   :if ($nm = "btest") do={ :do { /tool bandwidth-server set enabled=yes } on-error={} }
   :if ($nm = "smb") do={ :do { /ip smb set enabled=$v } on-error={} }
-  :if ($nm != "btest" && $nm != "smb" && $v = "off") do={ :do { /ip service set [find where name=$nm] disabled=no } on-error={} }
-  :if ([:pick $v 0 3] = "af=") do={
-    :local af [:pick $v 3 [:len $v]]
-    :do { /ip service set [find where name=$nm] available-from=$af } on-error={ :do { /ip service set [find where name=$nm] address=$af } on-error={} }
+  :if ($nm != "btest" && $nm != "smb") do={
+    :foreach s in=[/ip service find] do={
+      :local dyn ""
+      :do { :set dyn [:tostr [/ip service get $s dynamic]] } on-error={}
+      :if ($dyn != "true" && [/ip service get $s name] = $nm) do={
+        :if ($v = "off") do={ :do { /ip service set $s disabled=no } on-error={} }
+        :if ([:pick $v 0 3] = "af=") do={
+          :local af [:pick $v 3 [:len $v]]
+          :do { /ip service set $s available-from=$af } on-error={
+            :do { :local f [:parse "/ip service set \$sid address=\$val"]; $f sid=$s val=$af } on-error={}
+          }
+        }
+      }
+    }
   }
 }
 :do { /ip firewall address-list remove [find where comment~"^LBW:svc:"] } on-error={}
 
 # 6c. Log en disco de LBW (los archivos lbw-log se conservan como historial)
-:do { /system logging remove [find where action="lbw-disk"] } on-error={}
-:do { /system logging action remove [find where name="lbw-disk"] } on-error={}
+:do { /system logging remove [find where action="lbwdisk"] } on-error={}
+:do { /system logging action remove [find where name="lbwdisk"] } on-error={}
 
 # 7. Variables globales del monitor
 :do { /system script environment remove [find where name~"^LBW"] } on-error={}
@@ -2018,7 +2049,7 @@ def scan(path):
         if not s:
             continue
         if not (s.startswith('/') or s.startswith(':') or s.startswith('}')
-                or s.startswith(')') or s.startswith(']') or s.startswith('{')
+                or s.startswith(')') or s.startswith(']') or s.startswith('{') or s.startswith('$')
                 or s.startswith('comment=') or s.startswith('on-error=')
                 or code_lines[n-2][1].rstrip().endswith('\\')):
             warns.append((n, 1, f"la linea no empieza por / ni por : — ¿continuacion perdida?  >>> {s[:60]}"))
@@ -2081,6 +2112,23 @@ def scan(path):
         for m in re.finditer(r'address-list=!?([\w-]+)', code):
             if m.group(1) not in alists and not m.group(1).startswith('LBW-fijar-') and not code.lstrip().startswith('/ip firewall address-list'):
                 errs.append((n, 1, f"address-list {m.group(1)} usada sin crearse"))
+    # /ip service: desde RouterOS 7.19 lista tambien las conexiones abiertas como
+    # entradas dinamicas (con el mismo nombre: ssh, winbox...) que no se pueden
+    # editar; un set sobre ellas aborta el bloque entero
+    for idx, (n, code) in enumerate(code_lines):
+        if re.search(r'/ip service (set|get|enable|disable)\s+\[find where name=', code) and 'dynamic' not in code:
+            errs.append((n, 1, "/ip service [find where name=...] tambien encuentra las entradas dinamicas (conexiones, desde 7.19): filtra con !dynamic o comprueba 'dynamic' en cada entrada"))
+        if re.search(r'in=\[/ip service find', code):
+            ventana = ' '.join(c for _, c in code_lines[idx:idx + 4])
+            if 'dynamic' not in ventana:
+                errs.append((n, 1, ":foreach sobre /ip service sin saltar las entradas dinamicas (conexiones, desde 7.19), que no se pueden editar"))
+    # /system logging action: el nombre solo admite letras y numeros
+    for n, raw in enumerate(src.splitlines(), 1):
+        if raw.lstrip().startswith('#'):
+            continue
+        for m in re.finditer(r'/system logging action add\b[^\n]*?\bname=("?)([^"\s\]]+)', raw):
+            if not re.fullmatch(r'[A-Za-z0-9]+', m.group(2)):
+                errs.append((n, 1, f"accion de logging '{m.group(2)}': RouterOS solo admite letras y numeros en el nombre"))
     # PCC: todos los restos cubiertos una sola vez
     buckets = {}
     for n, code in code_lines:

@@ -179,25 +179,43 @@
 :do { /ip firewall filter add chain=forward action=drop connection-state=new connection-nat-state=!dstnat in-interface-list=LBW-WAN comment="LBW:FW:fwd-wan" } on-error={ :log error "LBW fallo: fw forward wan" }
 
 # --- 8c. Servicios del router (solo SSH y Winbox, desde 192.168.88.0/24) -------
+# Solo entradas estaticas: desde RouterOS 7.19 /ip service lista tambien las
+# conexiones abiertas como entradas dinamicas (incluida esta sesion SSH), y esas
+# no se pueden editar. En 7.24 "address" paso a llamarse "available-from";
+# "address" queda de respaldo para v7 anteriores, dentro de :parse para que
+# 7.24+ no avise de sintaxis vieja. Cada servicio va protegido por separado.
 :do {
   :local n 0
   :foreach s in=[/ip service find] do={
+    :local dyn ""
+    :do { :set dyn [:tostr [/ip service get $s dynamic]] } on-error={}
     :local nm [/ip service get $s name]
-    :if (($nm = "telnet" || $nm = "ftp" || $nm = "www" || $nm = "api" || $nm = "api-ssl" || $nm = "reverse-proxy") && ![/ip service get $s disabled]) do={
-      :set n ($n + 1)
-      :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . $n) comment=("LBW:svc:" . $nm . ":off") } on-error={}
-      /ip service set $s disabled=yes
-    }
-    :if ($nm = "ssh" || $nm = "winbox") do={
-      :local af ""
-      :do {
-        :foreach x in=[/ip service get $s available-from] do={ :if ([:len $af] > 0) do={ :set af ($af . ",") }; :set af ($af . $x) }
-      } on-error={
-        :do { :foreach x in=[/ip service get $s address] do={ :if ([:len $af] > 0) do={ :set af ($af . ",") }; :set af ($af . $x) } } on-error={}
+    :if ($dyn != "true") do={
+      :if ($nm = "telnet" || $nm = "ftp" || $nm = "www" || $nm = "api" || $nm = "api-ssl" || $nm = "reverse-proxy") do={
+        :do {
+          :if (![/ip service get $s disabled]) do={
+            :set n ($n + 1)
+            :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . $n) comment=("LBW:svc:" . $nm . ":off") } on-error={}
+            /ip service set $s disabled=yes
+          }
+        } on-error={ :log error ("LBW fallo: apagar servicio " . $nm) }
       }
-      :set n ($n + 1)
-      :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . $n) comment=("LBW:svc:" . $nm . ":af=" . $af) } on-error={}
-      :do { /ip service set $s available-from=192.168.88.0/24 } on-error={ /ip service set $s address=192.168.88.0/24 }
+      :if ($nm = "ssh" || $nm = "winbox") do={
+        :do {
+          :local cur ""
+          :do { :set cur [/ip service get $s available-from] } on-error={
+            :do { :local g [:parse ":return [/ip service get \$sid address]"]; :set cur [$g sid=$s] } on-error={}
+          }
+          :local af ""
+          :foreach x in=$cur do={ :if ([:len $af] > 0) do={ :set af ($af . ",") }; :set af ($af . $x) }
+          :set n ($n + 1)
+          :do { /ip firewall address-list add list=LBW-restore address=("127.0.2." . $n) comment=("LBW:svc:" . $nm . ":af=" . $af) } on-error={}
+          :do { /ip service set $s available-from=192.168.88.0/24 } on-error={
+            :local f [:parse "/ip service set \$sid address=192.168.88.0/24"]
+            $f sid=$s
+          }
+        } on-error={ :log error ("LBW fallo: limitar servicio " . $nm) }
+      }
     }
   }
   :do {
@@ -205,26 +223,26 @@
       :do { /ip firewall address-list add list=LBW-restore address=127.0.2.200 comment="LBW:svc:btest:on" } on-error={}
       /tool bandwidth-server set enabled=no
     }
-  } on-error={}
+  } on-error={ :log error "LBW fallo: apagar bandwidth-server" }
   :do {
     :local sm [:tostr [/ip smb get enabled]]
     :if ($sm != "no" && $sm != "false") do={
       :do { /ip firewall address-list add list=LBW-restore address=127.0.2.201 comment=("LBW:svc:smb:" . $sm) } on-error={}
       /ip smb set enabled=no
     }
-  } on-error={}
+  } on-error={ :log error "LBW fallo: apagar SMB" }
   :log warning "LBW: servicios del router endurecidos (solo SSH y Winbox desde 192.168.88.0/24)"
 } on-error={ :log error "LBW fallo: endurecer servicios" }
 
 # --- 8d. Log de LBW en disco (sobrevive a los reinicios) -------------
 :do {
-  :if ([:len [/system logging action find where name="lbw-disk"]] = 0) do={
+  :if ([:len [/system logging action find where name="lbwdisk"]] = 0) do={
     :local f "lbw-log"
     :do { :local d [/system logging action get [find where name="disk"] disk-file-name]; :if ([:pick $d 0 6] = "flash/") do={ :set f "flash/lbw-log" } } on-error={}
-    /system logging action add name=lbw-disk target=disk disk-file-name=$f disk-lines-per-file=2000 disk-file-count=2
+    /system logging action add name=lbwdisk target=disk disk-file-name=$f disk-lines-per-file=2000 disk-file-count=2
   }
-  :if ([:len [/system logging find where action="lbw-disk"]] = 0) do={
-    :do { /system logging add topics=script action=lbw-disk regex="LBW" } on-error={ /system logging add topics=script action=lbw-disk }
+  :if ([:len [/system logging find where action="lbwdisk"]] = 0) do={
+    :do { /system logging add topics=script action=lbwdisk regex="LBW" } on-error={ /system logging add topics=script action=lbwdisk }
   }
 } on-error={ :log error "LBW fallo: log en disco" }
 

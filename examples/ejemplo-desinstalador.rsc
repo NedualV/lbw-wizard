@@ -101,6 +101,9 @@
 }
 
 # 6b. Servicios del router como estaban antes de LBW
+#     Solo entradas estaticas: desde RouterOS 7.19 /ip service lista tambien las
+#     conexiones abiertas como entradas dinamicas con el mismo nombre (ssh,
+#     winbox...), y esas no se pueden editar.
 :foreach a in=[/ip firewall address-list find where comment~"^LBW:svc:"] do={
   :local c [/ip firewall address-list get $a comment]
   :local r [:pick $c 8 [:len $c]]
@@ -109,17 +112,27 @@
   :local v [:pick $r ($p + 1) [:len $r]]
   :if ($nm = "btest") do={ :do { /tool bandwidth-server set enabled=yes } on-error={} }
   :if ($nm = "smb") do={ :do { /ip smb set enabled=$v } on-error={} }
-  :if ($nm != "btest" && $nm != "smb" && $v = "off") do={ :do { /ip service set [find where name=$nm] disabled=no } on-error={} }
-  :if ([:pick $v 0 3] = "af=") do={
-    :local af [:pick $v 3 [:len $v]]
-    :do { /ip service set [find where name=$nm] available-from=$af } on-error={ :do { /ip service set [find where name=$nm] address=$af } on-error={} }
+  :if ($nm != "btest" && $nm != "smb") do={
+    :foreach s in=[/ip service find] do={
+      :local dyn ""
+      :do { :set dyn [:tostr [/ip service get $s dynamic]] } on-error={}
+      :if ($dyn != "true" && [/ip service get $s name] = $nm) do={
+        :if ($v = "off") do={ :do { /ip service set $s disabled=no } on-error={} }
+        :if ([:pick $v 0 3] = "af=") do={
+          :local af [:pick $v 3 [:len $v]]
+          :do { /ip service set $s available-from=$af } on-error={
+            :do { :local f [:parse "/ip service set \$sid address=\$val"]; $f sid=$s val=$af } on-error={}
+          }
+        }
+      }
+    }
   }
 }
 :do { /ip firewall address-list remove [find where comment~"^LBW:svc:"] } on-error={}
 
 # 6c. Log en disco de LBW (los archivos lbw-log se conservan como historial)
-:do { /system logging remove [find where action="lbw-disk"] } on-error={}
-:do { /system logging action remove [find where name="lbw-disk"] } on-error={}
+:do { /system logging remove [find where action="lbwdisk"] } on-error={}
+:do { /system logging action remove [find where name="lbwdisk"] } on-error={}
 
 # 7. Variables globales del monitor
 :do { /system script environment remove [find where name~"^LBW"] } on-error={}

@@ -93,7 +93,7 @@ Todo lo que crea LBW lleva un comentario que empieza por `LBW`. Lo que **aparta*
 | LAN creada (bridge-lan, IP, pool, DHCP) | nueva | `LBW:lan` | la borra y devuelve los puertos |
 | Enlace del modo balanceador | IP, pool, DHCP y rutas de vuelta | `LBW:link`, `LBW:downstream` | los borra |
 | Servicios del router | apagados o limitados | address-list `LBW-restore` (`LBW:svc:`) | los devuelve como estaban |
-| Log en disco | acción `lbw-disk` | por nombre | la quita (los archivos `lbw-log` se conservan) |
+| Log en disco | acción `lbwdisk` | por nombre | la quita (los archivos `lbw-log` se conservan) |
 | DNS del router | servidores elegidos | — | no se revierte |
 | NTP y zona horaria | activados | — | no se revierte (es inocuo) |
 
