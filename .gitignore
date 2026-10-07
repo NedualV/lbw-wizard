@@ -1,4 +1,4 @@
-lbw-[0-9]*.rsc
-pre-lbw.*
-*.backup
-*.old
+# Lo que genera el asistente al ejecutarse desde esta carpeta
+/*.rsc
+/*.backup
+/lbw-perfil-*.conf
